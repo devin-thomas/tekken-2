@@ -1,0 +1,307 @@
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 9f442678..e2c18025 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -2494,6 +2494,23 @@ function(psxrecomp_add_runtime_target target)
+             endif()
+         endif()
+     endif()
++    if(IOS)
++        # iOS (Tekken 2 patch 0007). iOS forbids generating or loading code at
++        # run time, so PSX_NO_RUNTIME_CODEGEN compiles out the overlay compiler
++        # spawn (gcc/tcc tiers), the overlay and BIOS-module dlopen paths and
++        # every other process spawn; overlays are ahead of time (static) or
++        # interpreted. The desktop GL backend still compiles against
++        # OpenGLES.framework plus gl_ios_shims.c for desktop-only GL 1.x calls,
++        # but main.cpp never selects it: the software renderer presents through
++        # SDL_Renderer (Metal). The title supplies psx_ios_prepare() (app home,
++        # disc import) and the .app bundle. 64 MiB main-thread stack, as the
++        # Windows builds use: SDL runs main() on the UIKit main thread.
++        target_compile_definitions(${target} PRIVATE PSX_IOS=1 PSX_NO_RUNTIME_CODEGEN=1)
++        target_sources(${target} PRIVATE ${PSXRECOMP_ROOT}/runtime/src/gl_ios_shims.c)
++        target_link_libraries(${target} PRIVATE
++            "-framework OpenGLES" "-framework UIKit" "-framework Foundation")
++        target_link_options(${target} PRIVATE -Wl,-stack_size,0x4000000)
++    endif()
+ 
+     # ---- Vulkan backend (gpu_vk_renderer.c) --------------------------------
+     # Vulkan is loaded ENTIRELY dynamically via SDL_Vulkan_LoadLibrary +
+diff --git a/runtime/src/autocompile.c b/runtime/src/autocompile.c
+index 3300923f..4e21c04d 100644
+--- a/runtime/src/autocompile.c
++++ b/runtime/src/autocompile.c
+@@ -990,6 +990,14 @@ static void autocompile_check_path_args(void) {
+ #endif /* _WIN32 */
+ 
+ void autocompile_configure(const char *cmd, const char *cwd) {
++#if defined(PSX_NO_RUNTIME_CODEGEN)
++    /* iOS (Tekken 2 patch 0007): no runtime code generation. Never record a
++     * command, so autocompile_configured() stays 0 and nothing is spawned. */
++    (void)cmd; (void)cwd;
++    fprintf(stderr, "psxrecomp: overlay autocompile is not available on this "
++                    "platform (no runtime code generation)\n");
++    return;
++#endif
+     if (cmd && strlen(cmd) >= sizeof(s_cmd)) {
+         /* Loud, and off: a truncated command line fails argparse on every retry
+          * with an error that never mentions the real cause. */
+@@ -1275,6 +1283,8 @@ static int autocompile_request_impl(void) {
+         return 0;
+     }
+     return 1;
++#elif defined(PSX_NO_RUNTIME_CODEGEN)
++    return 0;   /* iOS (Tekken 2 patch 0007): no compiler spawn */
+ #else
+     pthread_mutex_lock(&s_out_lock);
+     s_publish_drops_run = 0;
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 7586a9b9..e220d021 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -16,6 +16,9 @@
+ #  define _POSIX_C_SOURCE 200809L
+ #endif
+ #include <time.h>
++#if defined(PSX_NO_RUNTIME_CODEGEN)
++#include <sys/stat.h>   /* mkdir: iOS (Tekken 2 patch 0007) */
++#endif
+ #include "debug_server.h"
+ #include "debug_bulk_write.h"
+ #include "host_launch_timing.h"
+@@ -15565,6 +15568,8 @@ static void handle_overlay_dump(int id, const char *json)
+     /* Create output directory (best-effort). */
+ #ifdef _WIN32
+     { char cmd[600]; snprintf(cmd, sizeof(cmd), "mkdir \"%s\" 2>nul", dir_buf); system(cmd); }
++#elif defined(PSX_NO_RUNTIME_CODEGEN)
++    (void)mkdir(dir_buf, 0755);   /* iOS (Tekken 2 patch 0007): no shell */
+ #else
+     { char cmd[600]; snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", dir_buf); system(cmd); }
+ #endif
+diff --git a/runtime/src/gl_ios_shims.c b/runtime/src/gl_ios_shims.c
+new file mode 100644
+index 00000000..14c07f56
+--- /dev/null
++++ b/runtime/src/gl_ios_shims.c
+@@ -0,0 +1,27 @@
++/* gl_ios_shims.c (Tekken 2 patch 0007): desktop GL 1.x entry points that
++ * gpu_gl_renderer.c calls directly and that iOS's OpenGLES.framework does not
++ * export. The GL backend is never selected on iOS (main.cpp falls back to the
++ * software renderer), so these exist only to let the executable link. */
++#if defined(PSX_IOS)
++#define GLES_SILENCE_DEPRECATION 1
++#include <OpenGLES/ES3/gl.h>
++#include <stdio.h>
++
++static void shim_once(const char *name)
++{
++    static int warned;
++    if (!warned) {
++        warned = 1;
++        fprintf(stderr, "psxrecomp: desktop-only GL call %s on iOS ignored\n", name);
++    }
++}
++
++void glClearDepth(double depth) { glClearDepthf((GLfloat)depth); }
++
++void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type,
++                   void *pixels)
++{
++    (void)target; (void)level; (void)format; (void)type; (void)pixels;
++    shim_once("glGetTexImage");
++}
++#endif
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index aa6535bf..ffaf8f33 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -105,7 +105,14 @@
+ #include "host_deadline.h"
+ 
+ #include "psx_sdl.h"
+-#if defined(PSX_SDL3)
++#if defined(PSX_SDL3) && defined(PSX_IOS)
++/* iOS (Tekken 2 patch 0007): SDL_opengl.h declares nothing on iOS. Read its
++ * desktop GL declarations anyway so this backend compiles; it is linked
++ * against OpenGLES plus gl_ios_shims.c and never selected at run time. */
++#undef SDL_PLATFORM_IOS
++#include <SDL3/SDL_opengl.h>
++#define SDL_PLATFORM_IOS 1
++#elif defined(PSX_SDL3)
+ #include <SDL3/SDL_opengl.h>
+ #else
+ #include <SDL_opengl.h>
+diff --git a/runtime/src/host_overlay.c b/runtime/src/host_overlay.c
+index 9d45a46e..7350b686 100644
+--- a/runtime/src/host_overlay.c
++++ b/runtime/src/host_overlay.c
+@@ -335,6 +335,9 @@ void psx_relaunch_self(int argc, char** argv) {
+ void psx_relaunch_self(int argc, char** argv) {
+     char path[4096];
+     (void)argc;
++#if defined(PSX_NO_RUNTIME_CODEGEN)
++    (void)path; (void)argv;   /* iOS (Tekken 2 patch 0007): an app cannot exec itself */
++#else
+     if (!argv || !argv[0]) return;
+     path[0] = '\0';
+ #if defined(__APPLE__)
+@@ -363,5 +366,6 @@ void psx_relaunch_self(int argc, char** argv) {
+     }
+     fflush(NULL);
+     execv(path[0] ? path : argv[0], argv);
++#endif
+ }
+ #endif
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 6666ee5f..35968d50 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -194,6 +194,12 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
+  */
+ #include <SDL3/SDL_main.h>
+ #endif
++#if defined(PSX_IOS)
++/* iOS (Tekken 2 patch 0007): supplied by the title's app shell. Runs on the
++ * UIKit main thread at the top of main(): seeds the home directory, finds or
++ * imports the disc (Files document picker) and may append --disc to argv. */
++extern "C" __attribute__((weak)) void psx_ios_prepare(int* argc, char*** argv);
++#endif
+ #include "psx_sdl_audio.h"
+ #if defined(PSX_WEB)
+ #include <emscripten/emscripten.h>
+@@ -2996,6 +3002,16 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
+             exe_dir = fs::path(std::wstring(buf, buf + n)).parent_path();
+         }
+     }
++#endif
++#if defined(PSX_IOS)
++    /* iOS (Tekken 2 patch 0007): the executable sits in the read-only, signed
++     * app bundle. The title's psx_ios_prepare() seeds a writable home in the
++     * app container (game.toml, bios/, mods/, settings, saves) and names it
++     * in PSXRECOMP_HOME. */
++    if (exe_dir.empty()) {
++        if (const char* home = std::getenv("PSXRECOMP_HOME"); home && home[0])
++            exe_dir = fs::path(home);
++    }
+ #endif
+     // Inside an AppImage the binary lives in a read-only mount and argv[0] can
+     // be a bare name or symlink (launched via PATH / a .desktop file). $APPIMAGE
+@@ -11746,7 +11762,9 @@ namespace {
+ #endif
+         std::string cmd = std::string(py) + " \"" + script.string() + "\" \"" +
+                           source_path + "\" --out-dir \"" + out_dir.string() + "\"";
+-#if !defined(_WIN32)
++#if defined(PSX_NO_RUNTIME_CODEGEN)
++        int rc = -1;   /* iOS (Tekken 2 patch 0007): no process spawn */
++#elif !defined(_WIN32)
+         /* If python3 missing, retry with python. */
+         int rc = std::system(cmd.c_str());
+         if (rc != 0) {
+@@ -17778,6 +17796,13 @@ int main(int argc, char** argv) {
+     g_main_argv = argv;
+     const int regional_result = PSXRecompV4::regional::startup(argc, argv);
+     if (regional_result >= 0) return regional_result;
++#if defined(PSX_IOS)
++    if (psx_ios_prepare) {
++        psx_ios_prepare(&argc, &argv);
++        g_main_argc = argc;
++        g_main_argv = argv;
++    }
++#endif
+     /* Force line-buffered output so messages appear even if killed. */
+     std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+     std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
+@@ -20713,6 +20738,16 @@ session_reboot:
+                              "(PSX_ENABLE_VULKAN=OFF); using OpenGL instead.\n");
+         g_video_renderer = 1;
+     }
++#endif
++#if defined(PSX_IOS)
++    /* iOS (Tekken 2 patch 0007): no desktop OpenGL 3.3 context and no Vulkan,
++     * so any OpenGL or Vulkan request runs the software renderer, presented
++     * through SDL_Renderer (Metal). */
++    if (g_video_renderer != 0) {
++        std::fprintf(stdout, "psxrecomp: only the software renderer is available on iOS; "
++                             "using software instead.\n");
++        g_video_renderer = 0;
++    }
+ #endif
+     /* Netplay: CPU VRAM is digest/snap authority. Prefer dual-raster OpenGL
+      * (SW@1× + GL@settings SSAA FBO present, never glReadPixels). Vulkan
+diff --git a/runtime/src/mod_runtime.cpp b/runtime/src/mod_runtime.cpp
+index bfcf80de..0cb28d8f 100644
+--- a/runtime/src/mod_runtime.cpp
++++ b/runtime/src/mod_runtime.cpp
+@@ -909,6 +909,10 @@ bool run_xdelta_decode(const std::filesystem::path& executable,
+         return false;
+     }
+     return true;
++#elif defined(PSX_NO_RUNTIME_CODEGEN)
++    (void)executable; (void)source; (void)patch; (void)output;
++    if (error) *error = "the xdelta3 decoder cannot run on this platform";
++    return false;   /* iOS (Tekken 2 patch 0007): no process spawn */
+ #else
+     const pid_t child = fork();
+     if (child == 0) {
+diff --git a/runtime/src/overlay_posix.c b/runtime/src/overlay_posix.c
+index 5d59197f..026370c5 100644
+--- a/runtime/src/overlay_posix.c
++++ b/runtime/src/overlay_posix.c
+@@ -119,6 +119,14 @@ int psx_overlay_posix_find_other_cache_tag(const char *base_dir,
+ 
+ void *psx_overlay_posix_library_open(const char *path, char *error,
+                                      size_t error_size) {
++#if defined(PSX_NO_RUNTIME_CODEGEN)
++    /* iOS (Tekken 2 patch 0007): code is never loaded at run time; overlays
++     * are compiled in (static) or interpreted. */
++    (void)path;
++    if (error && error_size)
++        snprintf(error, error_size, "runtime-loaded overlay code is disabled on this platform");
++    return NULL;
++#endif
+     dlerror();
+     void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+     if (!handle && error && error_size) {
+diff --git a/runtime/src/psx_bios_module.c b/runtime/src/psx_bios_module.c
+index f771a816..bf8e5ae3 100644
+--- a/runtime/src/psx_bios_module.c
++++ b/runtime/src/psx_bios_module.c
+@@ -128,6 +128,10 @@ typedef struct {
+ 
+ static int probe_toolchain(const char *exe_dir, BmToolchain *tk) {
+     memset(tk, 0, sizeof(*tk));
++#if defined(PSX_NO_RUNTIME_CODEGEN)
++    (void)exe_dir;
++    return 0;   /* iOS (Tekken 2 patch 0007): no BIOS module compiler */
++#endif
+     if (!exe_dir || !exe_dir[0]) return 0;
+     snprintf(tk->dir, sizeof(tk->dir), "%s/overlay_toolchain", exe_dir);
+ #if defined(_WIN32)
+@@ -414,6 +418,9 @@ static int run_command(const char *cmd) {
+     CloseHandle(pi.hProcess);
+     CloseHandle(rd);
+     return (int)code;
++#elif defined(PSX_NO_RUNTIME_CODEGEN)
++    (void)cmd;
++    return -1;   /* iOS (Tekken 2 patch 0007): no process spawn */
+ #else
+     FILE *p = popen(cmd, "r");
+     char buf[1024];
+diff --git a/runtime/src/psx_keybinds.c b/runtime/src/psx_keybinds.c
+index 1f2167e6..be2d3e9f 100644
+--- a/runtime/src/psx_keybinds.c
++++ b/runtime/src/psx_keybinds.c
+@@ -201,6 +201,14 @@ static int path_is_directory(const char *path) {
+ /* Resolve keybinds.ini alongside exe_path. exe_path may be a file (argv[0] /
+  * the exe) or a directory (the exe dir the launcher passes) — either works. */
+ static void derive_ini_path(const char *exe_path) {
++#if defined(PSX_IOS)
++    /* iOS (Tekken 2 patch 0007): the bundle is read-only; keep keybinds.ini
++     * in the app's writable home (main.cpp's exe_dir_from_argv). */
++    {
++        const char *home = getenv("PSXRECOMP_HOME");
++        if (home && *home) exe_path = home;
++    }
++#endif
+     if (!exe_path || !*exe_path) {
+         strcpy(s_ini_path, "keybinds.ini");
+         return;

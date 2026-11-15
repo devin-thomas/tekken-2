@@ -1,0 +1,131 @@
+Subject: [PATCH] Resolve li-register jumps as constant transfers
+
+exact_resolve_constant_transfer accepted only lui(+addiu/ori) as a
+reaching definition, so `li t2,0xB0; jr t2` stayed an unresolved
+indirect jump. A Psy-Q BIOS thunk that is already a call target is
+skipped by the packed-thunk pass, so nothing bounded its extent: the
+legacy estimate ran to the next function start, the data after the
+thunk made the span look like data, and the thunk was emitted as a
+psx_unknown_dispatch stub (Tekken 2 USA Rev 1, 0x8002F5DC, the last
+thunk before a data table).
+
+addiu/ori from $zero into the jump register now defines the whole
+register under the same delay-slot and inbound-edge checks as lui.
+The thunk resolves to a transfer out of the image and ends after its
+delay slot.
+
+- reachable_discovery_test: a called thunk followed by data stays code
+  and ends at its delay slot (fails before this change).
+- split_transfer_fallthrough: the jump-shaped data after the thunk is
+  no longer emitted as a split transfer; assert it stays out.
+- OpenBIOS: regen_bios.sh output is byte-identical; only the emitter
+  fingerprint changes.
+
+---
+ generated/OpenBIOS.emitter.sha                |  2 +-
+ recompiler/src/function_analysis.cpp          | 15 +++++++++-
+ recompiler/tests/reachable_discovery_test.cpp | 29 +++++++++++++++++++
+ .../tests/test_split_transfer_fallthrough.py  |  9 ++++--
+ 4 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/generated/OpenBIOS.emitter.sha b/generated/OpenBIOS.emitter.sha
+--- a/generated/OpenBIOS.emitter.sha
++++ b/generated/OpenBIOS.emitter.sha
+@@ -1 +1 @@
+-58ed97502c77b329a79002a6fac9b6a1e0fe269c51fe078a724d8e30530eb54b
++ad6371c690209b8686d2389eb7f67a3f9858d44afea4ca7b07dc730f28423932
+diff --git a/recompiler/src/function_analysis.cpp b/recompiler/src/function_analysis.cpp
+index dc55bd551..b0256efe5 100644
+--- a/recompiler/src/function_analysis.cpp
++++ b/recompiler/src/function_analysis.cpp
+@@ -735,7 +735,14 @@ static bool exact_resolve_constant_transfer(const PS1Executable& exe,
+             low = static_cast<uint16_t>(instr & 0xFFFFu);
+             continue;
+         }
+-        if (opcode == 0x0Fu && rt == target_reg) {
++        // `lui rN,hi` defines the upper half; `li rN,imm` (addiu/ori from
++        // $zero) defines the whole register.  The second form is how Psy-Q
++        // BIOS thunks load 0xA0/0xB0/0xC0 before `jr rN`; without it a thunk
++        // that is already a call target has no bounded extent, and the data
++        // after it turns the thunk into a data stub.
++        const bool full_li = (opcode == 0x09u || opcode == 0x0Du) &&
++                             rs == 0u && rt == target_reg && target_reg != 0u;
++        if ((opcode == 0x0Fu || full_li) && rt == target_reg) {
+             // A definition in a control-transfer delay slot is not a local
+             // reaching definition for the linear suffix.  A call can clobber
+             // the register before returning at pc+4; a branch/jump can enter a
+@@ -775,6 +782,12 @@ static bool exact_resolve_constant_transfer(const PS1Executable& exe,
+             if (crossed_inbound_boundary) return false;
+ 
+             uint32_t upper = (instr & 0xFFFFu) << 16;
++            if (full_li) {
++                upper = (opcode == 0x09u)
++                    ? static_cast<uint32_t>(static_cast<int32_t>(
++                          static_cast<int16_t>(instr & 0xFFFFu)))
++                    : (instr & 0xFFFFu);
++            }
+             if (!have_low) {
+                 target_out = upper;
+             } else if (low_is_addiu) {
+diff --git a/recompiler/tests/reachable_discovery_test.cpp b/recompiler/tests/reachable_discovery_test.cpp
+index 4355f1065..48ad8fcc3 100644
+--- a/recompiler/tests/reachable_discovery_test.cpp
++++ b/recompiler/tests/reachable_discovery_test.cpp
+@@ -962,6 +962,35 @@ int main() {
+           thunk_starts.count(kLoad + 0x610),
+           "packed BIOS thunk bounds the following frameless leaf");
+ 
++    // A BIOS thunk that is already a call target (so the packed-thunk pass
++    // leaves it alone) and is followed by a data table must still end after
++    // its delay slot.  `li t2,0xB0; jr t2` is a constant transfer out of the
++    // image; leaving it unresolved let the data after the thunk set its
++    // extent and turned the thunk into a data stub (Tekken 2 0x8002F5DC).
++    {
++        auto called_thunk = make_exe_buffer(0x1000);
++        put32(called_thunk, text + 0x000, jal(kLoad + 0x600u));
++        put32(called_thunk, text + 0x004, 0x00000000u);
++        put32(called_thunk, text + 0x008, 0x03E00008u);
++        put32(called_thunk, text + 0x00C, 0x00000000u);
++        put32(called_thunk, text + 0x600, 0x240A00B0u); // li t2,0xB0
++        put32(called_thunk, text + 0x604, 0x01400008u); // jr t2
++        put32(called_thunk, text + 0x608, 0x24090050u); // li t1,0x50
++        put32(called_thunk, text + 0x60C, 0x00000000u);
++        for (size_t off = 0x610; off < 0x1000; off += 4)
++            put32(called_thunk, text + off, 0xFC000000u | static_cast<uint32_t>(off));
++        auto called_exe = parse(called_thunk);
++        auto called_result = PSXRecomp::FunctionAnalyzer(called_exe).analyze();
++        bool found_code_thunk = false;
++        for (const auto& function : called_result.functions) {
++            if (function.start_addr != kLoad + 0x600u) continue;
++            found_code_thunk = !function.is_data_section &&
++                               function.end_addr <= kLoad + 0x610u;
++        }
++        CHECK(found_code_thunk,
++              "called BIOS thunk before data stays code and ends at its delay slot");
++    }
++
+     // ---- No-split guard on EXPLICIT entries (overlay mode) ----------------
+     // A root is a hard cap, so an explicit entry that the entry below it
+     // reaches by fallthrough splits that function (beads-eio.3.177: Tomba
+diff --git a/recompiler/tests/test_split_transfer_fallthrough.py b/recompiler/tests/test_split_transfer_fallthrough.py
+index 14ef1af66..e0e911fcb 100644
+--- a/recompiler/tests/test_split_transfer_fallthrough.py
++++ b/recompiler/tests/test_split_transfer_fallthrough.py
+@@ -53,10 +53,15 @@ def main():
+             assert code, result.stdout
+             for address in ("80010028", "80010078"):
+                 assert f"func_{address}(cpu);  /* fallthrough to next function */" not in code
+-            transfers = ("CPS taken: split", "CPS not taken: split", "CPS j: split") if cps == "1" else (
+-                "taken: split piece", "not taken: split piece", "j to split (mid-func)")
++            transfers = ("CPS taken: split", "CPS not taken: split") if cps == "1" else (
++                "taken: split piece", "not taken: split piece")
+             for transfer in transfers:
+                 assert transfer in code, transfer
++            # The thunk at 0x80010060 resolves `li t2,0xB0; jr t2` as a
++            # constant transfer and ends after its delay slot, so the
++            # jump-shaped data at 0x80010070 is never emitted as code.
++            dead = "CPS j: split" if cps == "1" else "j to split (mid-func)"
++            assert dead not in code, dead
+             print(f"PASS: CPS={cps}, explicit transfers retained, dead fallthroughs/warnings absent")
+ 
+ 

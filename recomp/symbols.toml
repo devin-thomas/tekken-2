@@ -1,0 +1,315 @@
+# Symbols for Tekken 2 (USA) (Rev 1), boot EXE SLUS_002.13 v1.1.
+# Canonical source for scripts/sync_symbols.py, which derives
+# seeds/ghidra_funcs.txt and psx_symbols.h. Do not edit those by hand.
+#
+# status values:
+#   verified             checked against our own EXE
+#   unverified-external  published by someone else; not yet checked here
+#
+# source "openkumite": openkumite/kumite_converter
+#   docs/reference/tekken2/engine.md.
+#   Those notes are one author's and under a month old.
+#
+# jal_target records whether the address is the target of a direct JAL in
+# SLUS_002.13 (checked 2026-11-14). It is consistency evidence, not proof of a
+# name. [[func]] entries are seeded; [[ref]] entries are not (data or mid-function).
+
+[[func]]
+pc = "0x800227DC"
+name = "start"
+emit = false
+status = "verified"
+source = "PS-X EXE header pc0"
+note = "Boot entry point"
+
+[[func]]
+pc = "0x80012E50"
+name = "t2_PlayBgm"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "PlayBgm"
+
+[[func]]
+pc = "0x80013774"
+name = "t2_MoviePlayer"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = false
+note = "Movie player; not a JAL target but follows jr ra, so likely an indirect-call entry"
+
+[[func]]
+pc = "0x8001CF4C"
+name = "t2_RotTrans"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "RotTrans"
+
+[[func]]
+pc = "0x800627CC"
+name = "t2_GameStateCheck"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Reads game state 0x800A4150 (values 6, 7)"
+
+[[func]]
+pc = "0x8006B944"
+name = "t2_MotionDecode_B944"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Motion decoder"
+
+[[func]]
+pc = "0x8006BEC8"
+name = "t2_MotionDecode_BEC8"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Motion decoder"
+
+[[func]]
+pc = "0x8006C410"
+name = "t2_MotionDecode_C410"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Motion decoder"
+
+[[func]]
+pc = "0x8006C46C"
+name = "t2_LzDecode"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "LZ decoder"
+
+[[func]]
+pc = "0x8006C538"
+name = "t2_ArcLoad"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Arc loader"
+
+[[func]]
+pc = "0x8006EB38"
+name = "t2_ModelDraw"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Model draw"
+
+[[func]]
+pc = "0x80071CF8"
+name = "t2_SetRotTransMatrix"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "SetRotMatrix/SetTransMatrix"
+
+[[func]]
+pc = "0x80072234"
+name = "t2_BoneMatrixBuild"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Bone matrix builder"
+
+[[func]]
+pc = "0x80080FDC"
+name = "t2_ChainSetup"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Chain setup"
+
+[[func]]
+pc = "0x800810D4"
+name = "t2_ChainLayout"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Chain layout"
+
+[[func]]
+pc = "0x800811C4"
+name = "t2_ChainStep"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Chain step"
+
+[[func]]
+pc = "0x80082074"
+name = "t2_StageDescRelocate"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Stage description relocation"
+
+[[func]]
+pc = "0x80086FDC"
+name = "t2_SquareRoot0"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "SquareRoot0"
+
+[[func]]
+pc = "0x800A0018"
+name = "t2_CharacterLoad"
+emit = false
+status = "unverified-external"
+source = "openkumite"
+jal_target = true
+note = "Character loader (BNS records 24-399)"
+
+# ---- Not seeded: data, or code addresses that are not function starts ----
+
+[[ref]]
+addr = "0x80010160"
+name = "t2_BnsTable"
+kind = "data"
+status = "verified"
+source = "openkumite; checked 2026-11-14"
+note = "TEKKEN2.BNS table at EXE file offset 0x960: 400 x {0, sector, size}, sectors relative to TEKKEN2.BNS (LBA 525); the last record ends exactly at the file's 17,396th sector"
+
+[[ref]]
+addr = "0x80011490"
+name = "t2_XaTable"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "XA table"
+
+[[ref]]
+addr = "0x80013A00"
+name = "t2_XaEntryToCdPos"
+kind = "code-site"
+status = "unverified-external"
+source = "openkumite"
+note = "XA table entry to CD position; mid-function (no jr ra before it), so not seeded"
+
+[[ref]]
+addr = "0x8004E230"
+name = "t2_ConditionHandlerTable"
+kind = "data"
+status = "verified"
+source = "openkumite; checked 2026-11-14"
+note = "55 code pointers (0x80067E34-0x800684F8), none preceded by jr ra: a switch jump table. In [recompiler].data_ranges"
+
+[[ref]]
+addr = "0x8004E964"
+name = "t2_BoneParents"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Bone parent table (18-bone skeleton)"
+
+[[ref]]
+addr = "0x80042864"
+name = "t2_CommonMoves"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Common moves; move records are 0x2C bytes, 0x703-slot table"
+
+[[ref]]
+addr = "0x80056DA4"
+name = "t2_SineTable"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Sine table"
+
+[[ref]]
+addr = "0x8005C504"
+name = "t2_CharacterTable"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Character table"
+
+[[ref]]
+addr = "0x80066F38"
+name = "t2_MoveHeaderRelocate"
+kind = "code-site"
+status = "unverified-external"
+source = "openkumite"
+note = "Move header relocation; mid-function, so not seeded"
+
+[[ref]]
+addr = "0x8007BE20"
+name = "t2_GteProjectionH"
+kind = "code-site"
+status = "unverified-external"
+source = "openkumite"
+note = "Call site that sets GTE H = 955 (li a0, 0x3BB); not a function start"
+
+[[ref]]
+addr = "0x800A1030"
+name = "t2_StageLighting"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Stage lighting table"
+
+[[ref]]
+addr = "0x800A4150"
+name = "t2_GameState"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Game state word (BSS/RAM)"
+
+[[ref]]
+addr = "0x800C4638"
+name = "t2_ChainRecords"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Chain records, 0x168 bytes per player (RAM)"
+
+[[ref]]
+addr = "0x800D2E18"
+name = "t2_StageDesc"
+kind = "data"
+status = "unverified-external"
+source = "openkumite"
+note = "Relocated stage description (RAM)"
+
+[[ref]]
+addr = "0x80140000"
+name = "t2_OverlayBase4"
+kind = "overlay"
+status = "verified"
+source = "openkumite; checked 2026-11-14"
+note = "BNS record 4 (sector 151, 0x34800 bytes) is a PS-X EXE: t_addr 0x80140000, t_size 0x34000, pc 0x80155274"
+
+[[ref]]
+addr = "0x801BDFD8"
+name = "t2_OverlayBase17_20_21"
+kind = "overlay"
+status = "unverified-external"
+source = "openkumite"
+note = "Load address of BNS records 17, 20, 21. They are not raw images: each starts with a small u32 count (9, 12, 13), like the arc container format; record 21 holds pointers near 0x801BE00C"

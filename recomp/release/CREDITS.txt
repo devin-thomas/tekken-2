@@ -1,0 +1,45 @@
+Tekken 2 Recompiled 0.1.0: credits and licences
+===============================================
+
+Tekken 2 Recompiled is by Lil Gohan
+(Twitter: https://twitter.com/gohan__FGC, https://fgc.lilgohan.com).
+CONTRIBUTORS.txt names everyone who contributed to its own code.
+
+Each file named below is in the LICENSES folder next to this file. On a Mac
+the same files are also inside the app, in Contents/Resources/licenses.
+
+Tekken 2 Recompiled's own code
+  The controller, settings panel and fullscreen code, and the changes to
+  psxrecomp it carries. MIT licence.
+  LICENSES/Tekken2Recompiled-LICENSE.txt
+
+psxrecomp, by Matthew Stanley
+  The recompiler and the runtime the game runs on. PolyForm Noncommercial
+  License 1.0.0, with additional permissions for free projects.
+  LICENSES/psxrecomp-LICENSE.txt, LICENSES/psxrecomp-PERMISSIONS.md
+  The third-party parts psxrecomp links into the runtime (json11, libchdr,
+  stb_image, toml11, xxHash, libwebp and others) carry their notices in
+  the files psxrecomp ships, also in LICENSES.
+
+OpenBIOS, by the PCSX-Redux authors
+  The free PlayStation BIOS the game starts with. MIT licence.
+  LICENSES/OpenBIOS.LICENSE
+
+SDL 3, by Sam Lantinga and contributors
+  Windows, input, sound and graphics. zlib licence.
+  LICENSES/SDL3-LICENSE.txt
+
+stb_truetype, by Sean Barrett
+  Draws the settings panel's text. MIT licence or public domain.
+  LICENSES/stb_truetype-LICENSE.txt
+
+Noto Sans, Copyright 2012 Google Inc.
+  The settings panel's font, embedded in the app. SIL Open Font License 1.1.
+  LICENSES/NotoSans-OFL.txt
+
+Tekken is a registered trademark of Bandai Namco Entertainment Inc. Tekken 2,
+its code and its artwork are copyright Namco (now Bandai Namco Entertainment
+Inc.). The app icon is Namco's own artwork, the "T2" lettering from the
+game's stage cards, taken from the game. This project is not made, approved
+or endorsed by Bandai Namco. PlayStation is a
+registered trademark of Sony Interactive Entertainment Inc.

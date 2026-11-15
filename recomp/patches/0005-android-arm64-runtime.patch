@@ -1,0 +1,524 @@
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index cf4f099f..65d4d018 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -287,8 +287,16 @@ if(_psx_sdl_backend STREQUAL "SDL3")
+         # The fetched dependency is private to this build, so link it directly
+         # instead of producing an SDL3 DLL that would need platform-specific
+         # staging beside every generated game executable.
++        if(ANDROID)
++            # Android (Tekken 2 patch 0005): SDLActivity's Java side loads
++            # libSDL3.so and then libmain.so, and SDL's JNI entry points must
++            # be exported from libSDL3.so, so build it shared there.
++            set(SDL_SHARED ON CACHE BOOL "Build SDL3 shared library" FORCE)
++            set(SDL_STATIC OFF CACHE BOOL "Build SDL3 static library" FORCE)
++        else()
+         set(SDL_SHARED OFF CACHE BOOL "Build SDL3 shared library" FORCE)
+         set(SDL_STATIC ON CACHE BOOL "Build SDL3 static library" FORCE)
++        endif()
+         set(SDL_TEST_LIBRARY OFF CACHE BOOL "Build SDL3 test library" FORCE)
+         set(SDL_TESTS OFF CACHE BOOL "Build SDL3 tests" FORCE)
+         set(SDL_EXAMPLES OFF CACHE BOOL "Build SDL3 examples" FORCE)
+@@ -1701,12 +1709,30 @@ function(psxrecomp_add_runtime_target target)
+         set(mode_source ${PSXRECOMP_ROOT}/runtime/src/stub_interpreter.c)
+     endif()
+ 
++    if(ANDROID)
++        # Android (Tekken 2 patch 0005): SDLActivity dlopens libmain.so and
++        # calls SDL_main (SDL_main.h renames main). The desktop GL 3.3 backend
++        # still compiles (it loads modern GL through SDL) and links against
++        # GLES 3 plus gl_android_shims.c for the two desktop-only GL 1.x calls,
++        # but the runtime never selects it on Android: the software renderer
++        # presents through SDL_Renderer (GLES), and the Vulkan backend loads
++        # at run time as on desktop.
++        add_library(${target} SHARED
++            ${PSXRECOMP_RUNTIME_SOURCES}
++            ${PSXRECOMP_ROOT}/runtime/src/gl_android_shims.c
++            ${PSXRECOMP_ROOT}/runtime/src/android_touch_pad.c
++            ${mode_source}
++            ${generated_sources}
++            ${PSXRT_EXTRAS_SOURCES}
++        )
++    else()
+     add_executable(${target}
+         ${PSXRECOMP_RUNTIME_SOURCES}
+         ${mode_source}
+         ${generated_sources}
+         ${PSXRT_EXTRAS_SOURCES}
+     )
++    endif()
+     target_link_libraries(${target} PRIVATE chdr-static psx_texture_image_decode)
+     if(PSX_MEMORY_CARD_MANAGER)
+         target_compile_definitions(${target} PRIVATE PSX_MEMORY_CARD_MANAGER=1)
+@@ -1830,7 +1856,12 @@ function(psxrecomp_add_runtime_target target)
+     else()
+         set(_psxrt_overlay_flavor 0)
+     endif()
++    if(ANDROID)
++        # SDLActivity's default native library name.
++        set_target_properties(${target} PROPERTIES OUTPUT_NAME "main")
++    else()
+     set_target_properties(${target} PROPERTIES OUTPUT_NAME "${_psxrt_exe_name}")
++    endif()
+ 
+     # Publish the OVERLAY CODEGEN FLAVOR this target links with, for the same
+     # reason the exe name is published just below: so nothing downstream has to
+@@ -2411,6 +2442,11 @@ function(psxrecomp_add_runtime_target target)
+         if(MINGW)
+             target_link_libraries(${target} PRIVATE winpthread)
+         endif()
++    elseif(ANDROID)
++        # Tekken 2 patch 0005: GLES 3 instead of desktop GL; logcat; dl.
++        target_link_libraries(${target} PRIVATE GLESv3 log android ${CMAKE_DL_LIBS})
++        find_package(Threads REQUIRED)
++        target_link_libraries(${target} PRIVATE Threads::Threads)
+     else()
+         if(CMAKE_DL_LIBS)
+             target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+diff --git a/runtime/src/android_touch_pad.c b/runtime/src/android_touch_pad.c
+new file mode 100644
+index 00000000..5ecb5b7d
+--- /dev/null
++++ b/runtime/src/android_touch_pad.c
+@@ -0,0 +1,41 @@
++/* android_touch_pad.c (Tekken 2 patch 0005): the Android app shell's on-screen
++ * controller. T2Activity's TouchPadView handles the touches on the UI thread
++ * and passes the set of held PS buttons here; the runtime reads it as Player
++ * 1's host pad layer (main.cpp host_pad_layer), the same route the debug
++ * server's virtual pad takes, so menus, shortcuts and the guest pad all see it
++ * like a connected controller. One atomic word, no queue: the game thread
++ * samples whatever is held when it polls the pad. */
++#if defined(__ANDROID__)
++#include <jni.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <string.h>
++
++/* PSX pad bits, active high here (1 = held): Select 0x0001, Start 0x0008,
++ * Up 0x0010, Right 0x0020, Down 0x0040, Left 0x0080, L2 0x0100, R2 0x0200,
++ * L1 0x0400, R1 0x0800, Triangle 0x1000, Circle 0x2000, X 0x4000,
++ * Square 0x8000. */
++static _Atomic uint32_t s_held;
++
++JNIEXPORT void JNICALL
++Java_com_uppercutlabs_tekken2recomp_TouchPadView_nativeSetHeld(JNIEnv *env, jclass cls,
++                                                               jint held)
++{
++    (void)env; (void)cls;
++    atomic_store_explicit(&s_held, (uint32_t)held & 0xFFFFu, memory_order_release);
++}
++
++/* 1 while any on-screen button is held: *buttons gets the active-low PSX
++ * word, sticks centred, triggers released. 0 when nothing is held, so a
++ * keyboard or controller keeps working through the normal path. */
++int psx_android_touch_pad(uint16_t *buttons, uint8_t st[4], uint8_t *lt, uint8_t *rt)
++{
++    const uint32_t held = atomic_load_explicit(&s_held, memory_order_acquire);
++    if (!held) return 0;
++    if (buttons) *buttons = (uint16_t)(~held & 0xFFFFu);
++    if (st) memset(st, 0x80, 4);
++    if (lt) *lt = 0;
++    if (rt) *rt = 0;
++    return 1;
++}
++#endif
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index a1aa01aa..8a9faab4 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -867,6 +867,10 @@ static DMAGpuHoldStats s_hold_stats;
+ static uint64_t hold_host_ticks(void) {
+ #ifdef _WIN32
+     LARGE_INTEGER c; QueryPerformanceCounter(&c); return (uint64_t)c.QuadPart;
++#elif defined(__ANDROID__)
++    /* Tekken 2 patch 0005: bionic has timespec_get only from API 29. */
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);   /* diagnostics only */
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+ #else
+     struct timespec ts; timespec_get(&ts, TIME_UTC);   /* C11; diagnostics only */
+     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+diff --git a/runtime/src/gl_android_shims.c b/runtime/src/gl_android_shims.c
+new file mode 100644
+index 00000000..5ff8e20e
+--- /dev/null
++++ b/runtime/src/gl_android_shims.c
+@@ -0,0 +1,28 @@
++/* gl_android_shims.c (Tekken 2 patch 0005): desktop GL 1.x entry points that
++ * gpu_gl_renderer.c calls directly and that Android's libGLESv3 does not
++ * export. The GL backend is never selected on Android (main.cpp falls back
++ * to the software renderer), so these exist only to let the shared library
++ * load; bionic binds every symbol at load time. */
++#if defined(__ANDROID__)
++#include <GLES3/gl3.h>
++#include <android/log.h>
++
++static void shim_once(const char *name)
++{
++    static int warned;
++    if (!warned) {
++        warned = 1;
++        __android_log_print(ANDROID_LOG_WARN, "psxrecomp",
++                            "desktop-only GL call %s on Android ignored", name);
++    }
++}
++
++void glClearDepth(double depth) { glClearDepthf((GLfloat)depth); }
++
++void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type,
++                   void *pixels)
++{
++    (void)target; (void)level; (void)format; (void)type; (void)pixels;
++    shim_once("glGetTexImage");
++}
++#endif
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index 0faa63c6..146a7238 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -883,6 +883,28 @@ static int create_swapchain(void) {
+ #endif
+         ext.width = (uint32_t)w; ext.height = (uint32_t)h;
+     }
++#if defined(__ANDROID__)
++    /* Tekken 2 patch 0005: Android reports currentExtent and currentTransform
++     * for the display's current rotation. Handing currentTransform back as
++     * preTransform promises that every frame is already rotated for the
++     * panel, which this renderer never does: in landscape on a phone (natural
++     * orientation portrait, transform ROTATE_90) the compositor turned the
++     * frame a quarter turn and stretched it across the screen. Ask for an
++     * IDENTITY swapchain the size of the window as it is now and let the
++     * compositor rotate, as it does for every GLES app. Android then answers
++     * VK_SUBOPTIMAL_KHR in landscape, which acquire/present already accept. */
++    {
++        int w = 0, h = 0;
++        SDL_GetWindowSizeInPixels(s_win, &w, &h);
++        if (w > 0 && h > 0) { ext.width = (uint32_t)w; ext.height = (uint32_t)h; }
++        if (caps.maxImageExtent.width && ext.width > caps.maxImageExtent.width)
++            ext.width = caps.maxImageExtent.width;
++        if (caps.maxImageExtent.height && ext.height > caps.maxImageExtent.height)
++            ext.height = caps.maxImageExtent.height;
++        if (ext.width < caps.minImageExtent.width) ext.width = caps.minImageExtent.width;
++        if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
++    }
++#endif
+     s_sc_extent = ext;
+ 
+     uint32_t img_count = caps.minImageCount + 1;
+@@ -898,6 +920,10 @@ static int create_swapchain(void) {
+     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+     ci.preTransform = caps.currentTransform;
++#if defined(__ANDROID__)
++    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
++        ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++#endif
+     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+     ci.presentMode = choose_present_mode();
+     ci.clipped = VK_TRUE;
+@@ -1515,15 +1541,55 @@ void vk_renderer_set_present_mode(int mode) { s_present_mode_req = mode; }
+ /* Acquire a swapchain image, run `record` (which leaves it in
+  * PRESENT_SRC_KHR-ready state), submit, present. record may be NULL for a
+  * blank (the image is cleared to black). Returns 1 on success. */
++#if defined(__ANDROID__)
++/* Tekken 2 patch 0005. Android keeps the activity across rotation and the
++ * app shell resizes the game view (4:3 above or between the touch controls),
++ * so the window changes size without the swapchain going out of date (the
++ * compositor would scale the old-size image). Rebuild it whenever the window's
++ * pixel size no longer matches. After Home and back SDL hands the window a new
++ * ANativeWindow and the old VkSurfaceKHR is lost: make a new surface too. */
++static int android_rebuild_swapchain(int new_surface) {
++    p_vkDeviceWaitIdle(s_dev);
++    destroy_swapchain();
++    if (!new_surface && create_swapchain()) return 1;
++    if (s_swapchain) { p_vkDestroySwapchainKHR(s_dev, s_swapchain, NULL); s_swapchain = VK_NULL_HANDLE; }
++    if (s_surface) { p_vkDestroySurfaceKHR(s_instance, s_surface, NULL); s_surface = VK_NULL_HANDLE; }
++    if (!SDL_Vulkan_CreateSurface(s_win, s_instance, NULL, &s_surface)) {
++        s_surface = VK_NULL_HANDLE;
++        return vk_die("SDL_Vulkan_CreateSurface failed after the window changed");
++    }
++    fprintf(stdout, "psxrecomp: vulkan: new surface for the Android window\n");
++    return create_swapchain();
++}
++
++static int android_swapchain_ready(void) {
++    int w = 0, h = 0;
++    SDL_GetWindowSizeInPixels(s_win, &w, &h);
++    if (w <= 0 || h <= 0) return s_swapchain != VK_NULL_HANDLE;
++    if (s_swapchain && (uint32_t)w == s_sc_extent.width &&
++        (uint32_t)h == s_sc_extent.height) return 1;
++    return android_rebuild_swapchain(s_swapchain == VK_NULL_HANDLE);
++}
++#endif
++
+ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
+                            uint32_t *out_idx, uint32_t *out_frame) {
+     uint32_t fr = s_frame_idx % VK_FRAMES;
++#if defined(__ANDROID__)
++    if (!android_swapchain_ready()) return 0;
++#endif
+     p_vkWaitForFences(s_dev, 1, &s_fence[fr], VK_TRUE, UINT64_MAX);
+     uint32_t img_idx = 0;
+     uint64_t acquire_start = SDL_GetPerformanceCounter();
+     VkResult r = p_vkAcquireNextImageKHR(s_dev, s_swapchain, UINT64_MAX,
+                                          s_sem_acquire[fr], VK_NULL_HANDLE, &img_idx);
+     s_perf_cur.acquire_us += perf_elapsed_us(acquire_start);
++#if defined(__ANDROID__)
++    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
++        (void)android_rebuild_swapchain(r == VK_ERROR_SURFACE_LOST_KHR);
++        return 0;  /* skip this frame; next one uses the new swapchain */
++    }
++#endif
+     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+         p_vkDeviceWaitIdle(s_dev);
+         destroy_swapchain();
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 292a5b5c..05b4bb1b 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2976,6 +2976,17 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
+     namespace fs = std::filesystem;
+     std::error_code ec;
+     fs::path exe_dir;
++#if defined(__ANDROID__) && defined(PSX_SDL3)
++    /* Android (Tekken 2 patch 0005): the native library sits in a read-only,
++     * versioned package directory and SDLActivity's argv[0] names no file.
++     * Anchor every runtime file (game.toml, bios/, mods/, settings, disc.cfg,
++     * saves) in the app-private files directory instead: writable, per
++     * Android user, kept across updates, removed on uninstall. */
++    if (const char* storage = SDL_GetAndroidInternalStoragePath();
++        storage && storage[0]) {
++        exe_dir = fs::path(storage);
++    }
++#endif
+ #ifdef _WIN32
+     // Authoritative: the real image path, regardless of how we were invoked.
+     {
+@@ -6796,14 +6807,22 @@ extern "C" int psx_mod_read_local_pad_sticks(uint32_t player,
+  * sticks but still resolves presence/type. No mouse or source side effects:
+  * those are layered on top by pad_ext_resolve(). */
+ /* Debug host-pad layer (set_input {"layer":"host"}): a virtual P1 gamepad. */
++#if defined(__ANDROID__)
++/* Tekken 2 patch 0005: the on-screen controller (android_touch_pad.c). */
++extern "C" int psx_android_touch_pad(uint16_t* buttons, uint8_t st[4],
++                                     uint8_t* lt, uint8_t* rt);
++#endif
+ static int host_pad_layer(uint16_t* buttons, uint8_t st[4], uint8_t* lt,
+                           uint8_t* rt) {
+ #ifndef PSX_NO_DEBUG_TOOLS
+-    return debug_server_get_host_pad(buttons, st, lt, rt);
+-#else
++    if (debug_server_get_host_pad(buttons, st, lt, rt)) return 1;
++#endif
++#if defined(__ANDROID__)
++    /* While an on-screen button is held, P1 is the touch controller. */
++    if (psx_android_touch_pad(buttons, st, lt, rt)) return 1;
++#endif
+     (void)buttons; (void)st; (void)lt; (void)rt;
+     return 0;
+-#endif
+ }
+ 
+ /* The host layer's PSX word expressed as the Xbox-layout SDL buttons a
+@@ -17720,7 +17739,49 @@ static void host_pause_service(void) {
+     }
+ }
+ 
++#if defined(__ANDROID__)
++/* Android (Tekken 2 patch 0005): stdout/stderr of an app process go nowhere.
++ * Forward every line to logcat (tag "psxrecomp") and append it to
++ * <files>/psxrecomp.log, which `adb shell run-as <package> cat
++ * files/psxrecomp.log` reads on a debug build. */
++#include <android/log.h>
++#include <pthread.h>
++#include <unistd.h>
++static int s_android_log_fd = -1;
++static void* android_log_pump(void* arg) {
++    const int fd = (int)(intptr_t)arg;
++    FILE* in = fdopen(fd, "r");
++    if (!in) return nullptr;
++    char line[4096];
++    while (std::fgets(line, sizeof line, in)) {
++        size_t n = std::strlen(line);
++        if (s_android_log_fd >= 0) (void)!write(s_android_log_fd, line, n);
++        if (n && line[n - 1] == '\n') line[--n] = 0;
++        __android_log_write(ANDROID_LOG_INFO, "psxrecomp", line);
++    }
++    return nullptr;
++}
++static void android_redirect_stdio(void) {
++    int fds[2];
++    if (pipe(fds) != 0) return;
++    if (const char* storage = SDL_GetAndroidInternalStoragePath();
++        storage && storage[0]) {
++        std::string path = std::string(storage) + "/psxrecomp.log";
++        s_android_log_fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
++    }
++    dup2(fds[1], 1);
++    dup2(fds[1], 2);
++    close(fds[1]);
++    pthread_t t;
++    if (pthread_create(&t, nullptr, android_log_pump, (void*)(intptr_t)fds[0]) == 0)
++        pthread_detach(t);
++}
++#endif
++
+ int main(int argc, char** argv) {
++#if defined(__ANDROID__)
++    android_redirect_stdio();
++#endif
+     g_main_argc = argc;
+     g_main_argv = argv;
+     const int regional_result = PSXRecompV4::regional::startup(argc, argv);
+@@ -20633,6 +20694,23 @@ session_reboot:
+                              "retained textures; select the OpenGL renderer\n");
+         return 1;
+     }
++#if defined(__ANDROID__)
++    /* Tekken 2 patch 0005: Android has no desktop OpenGL 3.3 context, so an
++     * OpenGL request from any source (config, CLI, settings) runs the
++     * software renderer, presented through SDL_Renderer (GLES). */
++    if (g_video_renderer == 1) {
++        std::fprintf(stdout, "psxrecomp: OpenGL renderer is not available on Android; "
++                             "using software instead.\n");
++        g_video_renderer = 0;
++    }
++#ifndef PSX_HAVE_VULKAN
++    if (g_video_renderer == 2) {
++        std::fprintf(stdout, "psxrecomp: Vulkan renderer is not available in this build; "
++                             "using software instead.\n");
++        g_video_renderer = 0;
++    }
++#endif
++#endif
+ #ifndef PSX_HAVE_VULKAN
+     /* Vulkan was not compiled in (PSX_ENABLE_VULKAN=OFF or no SDK found).
+      * Refuse a vulkan request from ANY source (config / CLI / launcher seed)
+diff --git a/runtime/src/psx_fiber.c b/runtime/src/psx_fiber.c
+index a379eca0..bb88bb01 100644
+--- a/runtime/src/psx_fiber.c
++++ b/runtime/src/psx_fiber.c
+@@ -1,5 +1,5 @@
+ /*
+- * psx_fiber.c — Win32-Fiber / POSIX-ucontext backends for psx_fiber.h.
++ * psx_fiber.c — Win32-Fiber / Android-AArch64 / POSIX-ucontext backends for psx_fiber.h.
+  */
+ #include "psx_fiber.h"
+ 
+@@ -34,6 +34,117 @@ psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg
+ void psx_fiber_switch(psx_fiber_t target) { SwitchToFiber((LPVOID)target); }
+ void psx_fiber_destroy(psx_fiber_t fiber) { if (fiber) DeleteFiber((LPVOID)fiber); }
+ 
++#elif defined(__ANDROID__) && defined(__aarch64__)
++
++/* Android/AArch64. Bionic declares ucontext_t but implements none of
++ * getcontext/makecontext/swapcontext, so switch the AAPCS64 callee-saved state
++ * (x19-x30, sp, d8-d15) directly. Fibers are cooperative and never migrate
++ * between threads, as with the other backends.
++ *
++ * Tekken 2 patch 0005. Adapted from douglasjv's "Add shared Android runtime
++ * packaging" (psxrecomp fork commit 19233f496fe810fb57afc226b4ff4509c812bc8f,
++ * 2026-07-13), offered to psxrecomp and so under psxrecomp's licence. */
++#include <stdint.h>
++#include <stdlib.h>
++
++typedef struct psx_aarch64_context {
++    uint64_t x19_x30[12];
++    uint64_t sp;
++    uint64_t d8_d15[8];
++} psx_aarch64_context;
++
++typedef struct psx_fiber_impl {
++    psx_aarch64_context ctx;   /* must stay first: the swap addresses it */
++    void*               stack; /* NULL for the thread-fiber */
++    psx_fiber_entry     entry;
++    void*               arg;
++} psx_fiber_impl;
++
++/* Cooperative + single-threaded, as in the POSIX backend. */
++static psx_fiber_impl* s_current = NULL;
++
++/* x0 = save into, x1 = load from. Returns into the loaded x30. */
++__attribute__((naked, noinline)) static void
++psx_fiber_swap(psx_aarch64_context* from, psx_aarch64_context* to)
++{
++    __asm__ volatile(
++        "stp x19, x20, [x0, #0]\n"
++        "stp x21, x22, [x0, #16]\n"
++        "stp x23, x24, [x0, #32]\n"
++        "stp x25, x26, [x0, #48]\n"
++        "stp x27, x28, [x0, #64]\n"
++        "stp x29, x30, [x0, #80]\n"
++        "mov x2, sp\n"
++        "str x2, [x0, #96]\n"
++        "stp d8, d9, [x0, #104]\n"
++        "stp d10, d11, [x0, #120]\n"
++        "stp d12, d13, [x0, #136]\n"
++        "stp d14, d15, [x0, #152]\n"
++        "ldp d8, d9, [x1, #104]\n"
++        "ldp d10, d11, [x1, #120]\n"
++        "ldp d12, d13, [x1, #136]\n"
++        "ldp d14, d15, [x1, #152]\n"
++        "ldr x2, [x1, #96]\n"
++        "mov sp, x2\n"
++        "ldp x19, x20, [x1, #0]\n"
++        "ldp x21, x22, [x1, #16]\n"
++        "ldp x23, x24, [x1, #32]\n"
++        "ldp x25, x26, [x1, #48]\n"
++        "ldp x27, x28, [x1, #64]\n"
++        "ldp x29, x30, [x1, #80]\n"
++        "ret\n");
++}
++
++static void psx_fiber_trampoline(void)
++{
++    psx_fiber_impl* f = s_current;
++    f->entry(f->arg);
++    /* The BIOS thread entry never returns normally; see the POSIX backend. */
++    abort();
++}
++
++psx_fiber_t psx_fiber_convert_thread(void)
++{
++    if (!s_current)
++        s_current = (psx_fiber_impl*)calloc(1, sizeof(*s_current));
++    return (psx_fiber_t)s_current;
++}
++
++psx_fiber_t psx_fiber_current(void) { return (psx_fiber_t)s_current; }
++
++psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg)
++{
++    if (stack_size < 65536) stack_size = 65536;
++    psx_fiber_impl* f = (psx_fiber_impl*)calloc(1, sizeof(*f));
++    if (!f) return NULL;
++    f->stack = malloc(stack_size);
++    if (!f->stack) { free(f); return NULL; }
++    f->entry = entry;
++    f->arg   = arg;
++    uintptr_t top = ((uintptr_t)f->stack + stack_size) & ~(uintptr_t)15;
++    f->ctx.sp = (uint64_t)top;
++    f->ctx.x19_x30[10] = 0;                                   /* x29: frame chain end */
++    f->ctx.x19_x30[11] = (uint64_t)(uintptr_t)psx_fiber_trampoline;  /* x30 */
++    return (psx_fiber_t)f;
++}
++
++void psx_fiber_switch(psx_fiber_t target)
++{
++    psx_fiber_impl* to   = (psx_fiber_impl*)target;
++    psx_fiber_impl* from = s_current;
++    if (!to || !from || to == from) return;
++    s_current = to;
++    psx_fiber_swap(&from->ctx, &to->ctx);
++}
++
++void psx_fiber_destroy(psx_fiber_t fiber)
++{
++    psx_fiber_impl* f = (psx_fiber_impl*)fiber;
++    if (!f) return;
++    free(f->stack);
++    free(f);
++}
++
+ #else /* POSIX: ucontext */
+ 
+ #ifndef _XOPEN_SOURCE

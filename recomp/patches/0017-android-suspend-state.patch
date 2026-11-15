@@ -1,0 +1,105 @@
+diff --git a/runtime/include/savestate.h b/runtime/include/savestate.h
+index dd357e4f..648c0be1 100644
+--- a/runtime/include/savestate.h
++++ b/runtime/include/savestate.h
+@@ -25,6 +25,11 @@ extern "C" {
+ #define SAVESTATE_SLOTS 12
+ /* Independent quick-save file; the manual menu still has twelve slots. */
+ #define SAVESTATE_QUICK_SLOT SAVESTATE_SLOTS
++/* Tekken 2 patch 0017: the app's own suspend state, written when a phone app
++ * goes to the background and loaded if Android killed the process meanwhile
++ * (PSX_LOAD_SLOT=suspend). Not a user slot: no menu row, thumbnail or toast
++ * on save. */
++#define SAVESTATE_SUSPEND_SLOT (SAVESTATE_QUICK_SLOT + 1)
+ #define SAVESTATE_THUMB_W 128
+ #define SAVESTATE_THUMB_H 96
+ 
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index bdeb1878..0d8afc95 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1096,7 +1096,11 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok)
+         psx_savestate_menu_note_slots_changed();
+     if (is_load && ok)
+         savestate_input_guard_arm();
+-    if (slot == SAVESTATE_QUICK_SLOT) {
++    if (slot == SAVESTATE_SUSPEND_SLOT) {   /* Tekken 2 patch 0017 */
++        if (!is_load) return;                /* written while going to the background */
++        snprintf(buf, sizeof(buf), "%s", ok ? "Resumed where you left off"
++                                            : "Could not resume: starting over");
++    } else if (slot == SAVESTATE_QUICK_SLOT) {
+         snprintf(buf, sizeof(buf), "%s", is_load
+                  ? (ok ? "Quick loaded" : "Quick load failed")
+                  : (ok ? "Quick saved" : "Quick save failed"));
+@@ -22231,7 +22235,16 @@ session_reboot:
+         psx_rewind_configure(memory_get_bios_checksum(), game_entry_pc);
+         /* Headless load: PSX_LOAD_SLOT=N stages slot load (0..11)
+          * at the next safe block boundary after boot. */
+-        if (const char *ls = std::getenv("PSX_LOAD_SLOT"); ls && *ls) {
++        if (const char *ls = std::getenv("PSX_LOAD_SLOT"); ls && *ls && std::strcmp(ls, "suspend") == 0) {
++            /* Tekken 2 patch 0017: a phone app recreated after Android killed
++             * it in the background picks up its suspend state, if there is one. */
++            if (!savestate_slot_exists(SAVESTATE_SUSPEND_SLOT))
++                std::fprintf(stdout, "psxrecomp: PSX_LOAD_SLOT=suspend: no suspend state; starting fresh\n");
++            else if (savestate_request_load(SAVESTATE_SUSPEND_SLOT))
++                std::fprintf(stdout, "psxrecomp: PSX_LOAD_SLOT=suspend staged\n");
++            else
++                std::fprintf(stderr, "psxrecomp: PSX_LOAD_SLOT=suspend could not be staged\n");
++        } else if (const char *ls = std::getenv("PSX_LOAD_SLOT"); ls && *ls) {
+             char *end = nullptr;
+             const long parsed = std::strtol(ls, &end, 10);
+             if (!end || *end != '\0' || parsed < 0 || parsed >= SAVESTATE_SLOTS) {
+diff --git a/runtime/src/savestate.c b/runtime/src/savestate.c
+index f9c81c80..44a4a16b 100644
+--- a/runtime/src/savestate.c
++++ b/runtime/src/savestate.c
+@@ -527,13 +527,17 @@ static int savestate_format_slot_path(int slot, const char* extension, char* out
+     if (!out || cap == 0) return 0;
+     out[0] = '\0';
+     if (!s_configured || !s_content_scope_valid) return 0;
+-    if (slot < 0 || slot > SAVESTATE_QUICK_SLOT) return 0;
++    if (slot < 0 || slot > SAVESTATE_SUSPEND_SLOT) return 0;   /* patch 0017 */
+     /* Keyed by entry_pc so slots from different games in a shared dir never
+      * collide; boot_state_load also rejects a mismatched entry_pc internally. */
+     if (slot == SAVESTATE_QUICK_SLOT)
+         length = snprintf(out, cap, "%s%sstate_%08X%s%s_quick.%s",
+                  s_dir, (s_dir[0] ? "/" : ""), (unsigned)s_entry_pc,
+                  s_disc_token, s_content_token, extension);
++    else if (slot == SAVESTATE_SUSPEND_SLOT)   /* patch 0017 */
++        length = snprintf(out, cap, "%s%sstate_%08X%s%s_suspend.%s",
++                 s_dir, (s_dir[0] ? "/" : ""), (unsigned)s_entry_pc,
++                 s_disc_token, s_content_token, extension);
+     else
+         length = snprintf(out, cap, "%s%sstate_%08X%s%s_slot%02d.%s",
+              s_dir, (s_dir[0] ? "/" : ""), (unsigned)s_entry_pc,
+@@ -793,7 +797,7 @@ static int request_save_inner(int slot) {
+         psx_frontend_on_savestate_refused(0, slot, "Save states are not available yet");
+         return 0;
+     }
+-    if (slot < 0 || slot > SAVESTATE_QUICK_SLOT) return 0;
++    if (slot < 0 || slot > SAVESTATE_SUSPEND_SLOT) return 0;   /* patch 0017 */
+     s_save_failed = 0;
+     s_last_save_pc = 0; /* block netplay transfer until this write stamps a PC */
+     s_save_defer_slot = -1;
+@@ -813,7 +817,7 @@ static int request_load_inner(int slot) {
+         psx_frontend_on_savestate_refused(1, slot, "Save states are not available yet");
+         return 0;
+     }
+-    if (slot < 0 || slot > SAVESTATE_QUICK_SLOT) return 0;
++    if (slot < 0 || slot > SAVESTATE_SUSPEND_SLOT) return 0;   /* patch 0017 */
+     if (!psx_hle_scheduler_enabled()) {
+         /* LLE (host-fiber) mode: the restore longjmp target lives on the
+          * scheduler fiber; cross-fiber unwind is unsafe. HLE is the default. */
+@@ -1018,8 +1022,10 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
+                 if (ok) {
+                     s_last_save_pc = pc;
+                     s_save_failed = 0;
+-                    (void)savestate_capture_thumb(slot);
+-                    savestate_write_hd_residency(slot);
++                    if (slot != SAVESTATE_SUSPEND_SLOT) {   /* patch 0017: no readback while pausing */
++                        (void)savestate_capture_thumb(slot);
++                        savestate_write_hd_residency(slot);
++                    }
+                 } else {
+                     s_last_save_pc = 0;
+                     s_save_failed = 1;

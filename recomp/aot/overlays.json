@@ -1,0 +1,111 @@
+{
+  "schema": "psxrecomp AOT methods v1",
+  "game_id": "SLUS-00213",
+  "disc_hashes": {
+    "sha256": "423b71e067f86900ac7d7a82be46a9df6de2e79b383ef3c92251475e5a64889e"
+  },
+  "static_output": "generated/overlays_static.c",
+  "strict_bounds": true,
+  "expected_records": 6,
+  "checks": [
+    {
+      "method": "words",
+      "file": "SLUS_002.13",
+      "file_offset": "0x800",
+      "base": "0x80010000",
+      "values": {
+        "0x80010190": "0x0",
+        "0x80010194": "0x97",
+        "0x80010198": "0x34800",
+        "0x8001019c": "0x0",
+        "0x800101a0": "0x100",
+        "0x800101a4": "0x2280c",
+        "0x8001022c": "0x0",
+        "0x80010230": "0x317",
+        "0x80010234": "0x37300",
+        "0x80010244": "0x0",
+        "0x80010248": "0x3ca",
+        "0x8001024c": "0x36d90",
+        "0x80010250": "0x0",
+        "0x80010254": "0x438",
+        "0x80010258": "0x3197c",
+        "0x8001025c": "0x0",
+        "0x80010260": "0x49c",
+        "0x80010264": "0x80c4",
+        "0x80011998": "0x801bdfd8",
+        "0x8008bafc": "0x8ca51998"
+      }
+    }
+  ],
+  "images": [
+    {
+      "method": "fixed_address_extents",
+      "allow_missing": true,
+      "entries": [
+        "0x80155274"
+      ],
+      "extents": [
+        {
+          "file": "TEKKEN2/TEKKEN2.BNS",
+          "file_offset": "0x4C000",
+          "base": "0x80140000",
+          "address": "0x80140000",
+          "size": "0x34000",
+          "load_addr": "0x80140000",
+          "sha256": "6d36c7b9f875db1692488c4e211c98ee2b51f327ec70a5dfcd1f11a1aaf14b2a"
+        }
+      ]
+    },
+    {
+      "method": "fixed_address_extents",
+      "allow_missing": true,
+      "extents": [
+        {
+          "file": "TEKKEN2/TEKKEN2.BNS",
+          "file_offset": "0x80000",
+          "base": "0x801BDFD8",
+          "address": "0x801BDFD8",
+          "size": "0x2280c",
+          "load_addr": "0x801BDFD8",
+          "sha256": "a5a97f1d72bf6e67c327ce3dc124e172f902bda8cf6976aea2500caa0b0aca21"
+        },
+        {
+          "file": "TEKKEN2/TEKKEN2.BNS",
+          "file_offset": "0x18b800",
+          "base": "0x801BDFD8",
+          "address": "0x801BDFD8",
+          "size": "0x37300",
+          "load_addr": "0x801BDFD8",
+          "sha256": "04b895e1613594641ce6e4a04cbae917c9eacdd8ea457964dff11f85990f67e1"
+        },
+        {
+          "file": "TEKKEN2/TEKKEN2.BNS",
+          "file_offset": "0x1e5000",
+          "base": "0x801BDFD8",
+          "address": "0x801BDFD8",
+          "size": "0x36d90",
+          "load_addr": "0x801BDFD8",
+          "sha256": "20abad1c739237149fe56668d851eacd022891042a7561e59aa66311ba872495"
+        },
+        {
+          "file": "TEKKEN2/TEKKEN2.BNS",
+          "file_offset": "0x21c000",
+          "base": "0x801BDFD8",
+          "address": "0x801BDFD8",
+          "size": "0x3197c",
+          "load_addr": "0x801BDFD8",
+          "sha256": "6d7b4997ed9d07f722d40498073e6f4d413e291674d3e619640ef82707d4a486"
+        },
+        {
+          "file": "TEKKEN2/TEKKEN2.BNS",
+          "file_offset": "0x24e000",
+          "base": "0x801BDFD8",
+          "address": "0x801BDFD8",
+          "size": "0x80c4",
+          "load_addr": "0x801BDFD8",
+          "sha256": "a5919526808aaa8421ebfab72436905339a62c2121e9744a38c55ac116b0fe0c"
+        }
+      ]
+    }
+  ]
+}

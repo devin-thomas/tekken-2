@@ -1,0 +1,661 @@
+diff --git a/runtime/include/psx_video_timing.h b/runtime/include/psx_video_timing.h
+index 1769fd13..ff77c690 100644
+--- a/runtime/include/psx_video_timing.h
++++ b/runtime/include/psx_video_timing.h
+@@ -46,6 +46,39 @@ static inline int psx_gp1_display_mode_is_pal(uint32_t word) {
+ 
+ /* Select the video standard. Returns 1 when it changed. */
+ int      psx_video_timing_set_pal(int pal);
++/* Hardware frame period (Tekken 2 patch 0009, psx_video_timing.c): the
++ * scanline grid on the video clock, NTSC 566203.78 / PAL 680823.46 CPU
++ * cycles, instead of the 60/50 Hz constants. On in REFERENCE builds, off in
++ * ENHANCED; PSX_VIDEO_TIMING=1/0 overrides. set_hardware(-1) re-reads it. */
++int      psx_video_timing_hardware(void);
++void     psx_video_timing_set_hardware(int on);
++/* Call once per VBlank edge, after psx_vblank_consume_edge(): selects the
++ * next frame's period (floor or floor + 1 of the exact ratio). No-op when
++ * the hardware period is off. */
++void     psx_video_timing_frame_edge(void);
++/* One scanline in CPU cycles on the hardware grid (NTSC 3413 * 451584 /
++ * 715909 = 2152.87, PAL 3406 * 451584 / 709379 = 2168.23). */
++double   psx_video_timing_line_cycles(void);
++
++/* CRTC beam (gpu.c, hardware frame period): the frame's state as of its
++ * VBlank edge. `field`/`bit13` are the CRTC field and GPUSTAT bit 13 after
++ * the last applied wrap (beam from the last line to line 0), `dfield` the
++ * displayed field latched at the edge. Positions are in lines on a grid of
++ * `total` lines; `raw` may exceed `total` once the beam has wrapped. */
++typedef struct {
++    uint32_t total, y1, y2, disp_y;
++    int      interlace, vres480, wrap_done;
++    uint32_t field, bit13, dfield;
++} PsxCrtcBeam;
++/* The wrap: interlace on flips the field and bit 13 = !field; off zeroes both. */
++void     psx_crtc_wrap(uint32_t *field, uint32_t *bit13, int interlace);
++/* GPUSTAT bits 13 and 31 with the beam at `raw`. */
++uint32_t psx_crtc_status_bits(const PsxCrtcBeam *b, double raw);
++/* Lines until the beam enters vertical blanking at new_y2, from `pos`
++ * (in [0, total)) where old_y2 was in force: 0 when the beam is in the
++ * display area already past new_y2, never 0 when it is in vblank. */
++double   psx_crtc_lines_to_vblank(double pos, uint32_t y1, uint32_t old_y2,
++                                  uint32_t new_y2, uint32_t total);
+ int      psx_video_timing_is_pal(void);
+ /* Bumped on every change; host-side observers (pacing) compare it. */
+ uint32_t psx_video_timing_generation(void);
+diff --git a/runtime/include/spu_dma_timing.h b/runtime/include/spu_dma_timing.h
+new file mode 100644
+index 00000000..f2180e19
+--- /dev/null
++++ b/runtime/include/spu_dma_timing.h
+@@ -0,0 +1,40 @@
++#ifndef PSXRECOMP_SPU_DMA_TIMING_H
++#define PSXRECOMP_SPU_DMA_TIMING_H
++
++/* SPU DMA write time on the DuckStation reference (Tekken 2 patch 0009).
++ *
++ * DuckStation ffb33c28 moves a RAM-to-SPU transfer in 16-word blocks, one
++ * each time the SPU's 32-halfword transfer FIFO has drained into SPU RAM.
++ * Measured on Tekken 2's own uploads (difftrace PC log: DMA4 slices and the
++ * DMA IRQ): 29,216 words in 920,756 cycles and 44,240 words in 1,394,480,
++ * that is 504.5 cycles a block after the first (31.53 a word), against the 48
++ * a word of the Beetle model psxrecomp used. Tekken 2's upload before its
++ * first scene finished 0.73 million cycles (1.3 VBlanks) late and moved the
++ * scene's setup a frame. PSX-SPX gives no transfer rate. SPU-to-RAM
++ * transfers keep the Beetle cost (not measured).
++ *
++ * On in REFERENCE builds, off in ENHANCED; PSX_SPU_DMA_TIMING=1/0 overrides
++ * (dma.c). */
++
++#include "execution_profile.h"
++
++#include <stdint.h>
++
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define DMA_SPU_TIMING_DEFAULT 1
++#else
++#define DMA_SPU_TIMING_DEFAULT 0
++#endif
++
++#define DMA_SPU_BLOCK_X2      1009u   /* 504.5 cycles a 16-word block */
++#define DMA_SPU_FIRST_CYCLES  43u
++
++/* Cycles from the kick to the completion of a `words`-word RAM-to-SPU DMA. */
++static inline uint32_t dma_spu_write_cycles(uint32_t words) {
++    const uint64_t blocks = ((uint64_t)words + 15u) / 16u;
++    if (blocks == 0) return 0;
++    const uint64_t c = ((blocks - 1u) * DMA_SPU_BLOCK_X2 + 1u) / 2u + DMA_SPU_FIRST_CYCLES;
++    return c > UINT32_MAX ? UINT32_MAX : (uint32_t)c;
++}
++
++#endif
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index bb4bf372..280e7a5a 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -603,6 +603,19 @@ if(PSX_NETPLAY AND NOT RECOMP_NET_ROOT)
+         endif()
+     endforeach()
+ endif()
++
++# Frame period, CRTC beam and SPU DMA timing (Tekken 2 patch 0009).
++if(BUILD_TESTING AND NOT TARGET vblank_alignment_test)
++    add_executable(vblank_alignment_test
++        ${PSXRECOMP_ROOT}/runtime/tests/test_vblank_alignment.c
++        ${PSXRECOMP_ROOT}/runtime/src/psx_video_timing.c)
++    target_include_directories(vblank_alignment_test PRIVATE ${PSXRECOMP_ROOT}/runtime/include)
++    if(NOT WIN32)
++        target_link_libraries(vblank_alignment_test PRIVATE m)
++    endif()
++    add_test(NAME vblank_alignment_test COMMAND vblank_alignment_test)
++    set_tests_properties(vblank_alignment_test PROPERTIES ENVIRONMENT "PSX_VIDEO_TIMING=")
++endif()
+ if(PSX_NETPLAY AND RECOMP_NET_ROOT AND EXISTS "${RECOMP_NET_ROOT}/CMakeLists.txt")
+     if(NOT TARGET recomp_net)
+         set(RNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index 2f40e74e..b0c4daf8 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -32,6 +32,8 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include "execution_profile.h"
++#include "spu_dma_timing.h"
+ #include <string.h>
+ #include <time.h>
+ #ifdef _WIN32
+@@ -158,6 +160,16 @@ void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *
+  * only the busy-bit clear + completion IRQ are deferred). */
+ #define DMA_SPU_CYCLES_PER_WORD      48u
+ 
++/* SPU DMA write time in REFERENCE builds: spu_dma_timing.h. */
++static int dma_spu_timing(void) {
++    static int s_on = -1;
++    if (s_on < 0) {
++        const char *e = getenv("PSX_SPU_DMA_TIMING");
++        s_on = (e && (e[0] == '0' || e[0] == '1')) ? (e[0] == '1') : DMA_SPU_TIMING_DEFAULT;
++    }
++    return s_on;
++}
++
+ /* DMA-execution provenance flags (read by memory.c's psx_write_word d44_note probe
+  * for the MMX6 VSync-callback-pointer corruption hunt). g_dma_exec_depth>0 means a
+  * DMA is currently moving data through psx_write_word, so a RAM write seen there is
+@@ -1280,10 +1292,15 @@ static void try_execute(int ch) {
+         case 3:
+             execute_ch3_cdrom();
+             break;
+-        case 4:
+-            schedule_delayed_complete(4, execute_ch4_spu(),
+-                                      DMA_SPU_CYCLES_PER_WORD);
++        case 4: {
++            const int to_spu = (channels[4].chcr & 1u) != 0;
++            const uint32_t words = execute_ch4_spu();
++            schedule_delayed_complete(4, words, DMA_SPU_CYCLES_PER_WORD);
++            /* Measured DuckStation block pacing (dma_spu_write_cycles). */
++            if (to_spu && dma_spu_timing() && delayed_complete[4].active)
++                delayed_complete[4].cycles_remaining = dma_spu_write_cycles(words);
+             break;
++        }
+         case 5:
+             execute_ch5_pio();
+             break;
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 1036241f..ef510d4e 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -4134,6 +4134,99 @@ static uint32_t h_display_x2;
+ static uint32_t v_display_y1;
+ static uint32_t v_display_y2;
+ 
++/* ---- Hardware CRTC position (Tekken 2 patch 0009) ----
++ * With the hardware frame period on (psx_video_timing_hardware(), REFERENCE
++ * builds), the VBlank edge is where the beam enters vertical blanking: the
++ * scanline Y2 of GP1(07h) on a free-running grid of 263 (PAL 314) lines that
++ * starts with line 0 at power-on, as on the console (PSX-SPX "GPU Timings",
++ * "GP1(07h)"). GPUSTAT bit 13 (interlace field) flips when the beam wraps
++ * from the last line to line 0, and bit 31 follows the line being scanned
++ * out: in 480-line interlace the field being displayed (0 in vblank), else
++ * the scanline's own parity, both offset by the display area's Y (GP1(05h)).
++ * DuckStation ffb33c28 (GPU::UpdateCRTC... read for behaviour only) does the
++ * same. Without this, OpenBIOS's shell, which waits for each field by polling
++ * bits 31 and 13, left its intro loop a frame earlier than DuckStation.
++ * Position on the grid: s_hw_line_base + cycles since the VBlank edge (in
++ * lines); a GP1(07h) that moves Y2 moves the next edge. */
++uint32_t interrupts_get_cycles_since_vblank(void);
++void     interrupts_set_cycles_since_vblank(uint32_t v);
++static double   s_hw_line_base;   /* grid line at cycles_since_vblank == 0 */
++static uint32_t s_hw_field;       /* CRTC field, as of the last applied wrap */
++static uint32_t s_hw_bit13;       /* GPUSTAT bit 13, latched at each wrap */
++static uint32_t s_hw_dfield;      /* displayed field, latched at the edge */
++static int      s_hw_wrap_done;   /* this frame's wrap already applied */
++
++static uint32_t hw_line_clamp(uint32_t y) {
++    return y < g_psx_lines_per_frame ? y : g_psx_lines_per_frame;
++}
++
++static double hw_line_pos(void) {
++    return s_hw_line_base + (double)interrupts_get_cycles_since_vblank() /
++                            psx_video_timing_line_cycles();
++}
++
++/* Apply this frame's wrap if the beam has passed it (before GP1(08h)
++ * changes the interlace bit the wrap depends on). */
++static void hw_sync_wrap(void) {
++    if (!s_hw_wrap_done && hw_line_pos() >= (double)g_psx_lines_per_frame) {
++        psx_crtc_wrap(&s_hw_field, &s_hw_bit13, (int)vertical_interlace);
++        s_hw_wrap_done = 1;
++    }
++}
++
++/* Put the beam at grid position `pos` (lines, in [0, total)) now, with the
++ * next VBlank edge `to_go` lines away. */
++static void hw_set_beam(double pos, double to_go) {
++    const double line = psx_video_timing_line_cycles();
++    double since = (double)g_psx_vblank_cycles - to_go * line;
++    if (since < 0.0) since = 0.0;
++    if (since > (double)g_psx_vblank_cycles) since = (double)g_psx_vblank_cycles;
++    interrupts_set_cycles_since_vblank((uint32_t)(since + 0.5));
++    s_hw_line_base = pos - (double)interrupts_get_cycles_since_vblank() / line;
++}
++
++/* Y2 moved from old_y2 to new_y2 (GP1(07h), GP1(00h)): the next edge is
++ * where the beam next reaches new_y2, at once if the beam is in the display
++ * area already past it. */
++static void hw_vblank_retarget(uint32_t y1, uint32_t old_y2, uint32_t new_y2) {
++    const double total = (double)g_psx_lines_per_frame;
++    hw_sync_wrap();
++    const double raw = hw_line_pos();
++    const double pos = raw >= total ? raw - total : raw;
++    /* (a wrap the beam passed was applied above) */
++    hw_set_beam(pos, psx_crtc_lines_to_vblank(pos, y1, old_y2, new_y2, g_psx_lines_per_frame));
++}
++
++/* At a VBlank edge (gpu_vblank_tick): finish the frame's wrap, latch the
++ * displayed field, and restart the frame at line Y2. */
++static void hw_vblank_edge(void) {
++    const double line = psx_video_timing_line_cycles();
++    if (!s_hw_wrap_done && s_hw_line_base >= -0.5)
++        psx_crtc_wrap(&s_hw_field, &s_hw_bit13, (int)vertical_interlace);
++    s_hw_wrap_done = 0;
++    s_hw_dfield = (vertical_interlace && vres) ? (s_hw_field ^ 1u) : 0u;
++    s_hw_line_base = (double)hw_line_clamp(v_display_y2) -
++                     (double)interrupts_get_cycles_since_vblank() / line;
++}
++
++/* Power-on (interrupts_init): line 0 now, the first edge at Y2. */
++void gpu_hw_crtc_power_on(void) {
++    if (!psx_video_timing_hardware()) return;
++    s_hw_field = 0;         /* power-on: field 0, GPUSTAT 14802000h (bit 13 set) */
++    s_hw_bit13 = 1;
++    s_hw_dfield = 0;
++    s_hw_wrap_done = 0;
++    hw_set_beam(0.0, (double)hw_line_clamp(v_display_y2));
++}
++
++/* GPUSTAT bits 13 and 31 from the beam position. */
++static uint32_t hw_gpustat_field_bits(void) {
++    const PsxCrtcBeam b = { g_psx_lines_per_frame, v_display_y1, v_display_y2, display_area_y,
++                            (int)vertical_interlace, (int)vres, s_hw_wrap_done,
++                            s_hw_field, s_hw_bit13, s_hw_dfield };
++    return psx_crtc_status_bits(&b, hw_line_pos());
++}
++
+ /* GPUREAD latch (GP1(10h) get-info result, or VRAM read data) */
+ static uint32_t gpuread_latch;
+ 
+@@ -4401,6 +4494,11 @@ uint32_t gpu_read_gpustat(void) {
+     /* Bit 31: LCF — drawing even/odd lines in interlace mode */
+     stat |= (lcf & 1) << 31;
+ 
++    /* Hardware frame period on: bits 13 and 31 follow the beam
++     * (hw_gpustat_field_bits, Tekken 2 patch 0009). */
++    if (psx_video_timing_hardware())
++        stat = (stat & ~((1u << 13) | (1u << 31))) | hw_gpustat_field_bits();
++
+     return stat;
+ }
+ 
+@@ -4544,6 +4642,8 @@ void gpu_vblank_flush_present(void) {
+ 
+ void gpu_vblank_tick(void) {
+     lcf ^= 1;
++    if (psx_video_timing_hardware())
++        hw_vblank_edge();
+     gpu_timeline_note(GTL_VBLANK, lcf, 0);
+     /* GPUSTAT.13 (interlace FIELD): on real hardware this alternates per
+      * field while GP1(08h) vertical interlace is on, in antiphase with the
+@@ -8252,7 +8352,11 @@ static void gp1_reset(void) {
+     /* GP1(00h): Reset GPU — clears FIFO/control state and disables display.
+      * VRAM contents survive a GPU reset on real hardware; only power-on init
+      * clears our backing store. */
++    const uint32_t old_y1 = v_display_y1, old_y2 = v_display_y2;
+     gpu_reset_state(0);
++    /* Hardware frame period: the reset's Y2 moves the next VBlank edge. */
++    if (psx_video_timing_hardware() && hw_line_clamp(old_y2) != hw_line_clamp(v_display_y2))
++        hw_vblank_retarget(old_y1, old_y2, v_display_y2);
+ }
+ 
+ static void gp1_reset_command_buffer(void) {
+@@ -8321,6 +8425,9 @@ static void gp1_v_display_range(uint32_t val) {
+         s_d24_upload_x1 = 0;
+         s_d24_present_hold = 3;
+     }
++    /* Hardware frame period: the next VBlank edge follows Y2. */
++    if (psx_video_timing_hardware() && hw_line_clamp(y2) != hw_line_clamp(v_display_y2))
++        hw_vblank_retarget(v_display_y1, v_display_y2, y2);
+     v_display_y1 = y1;
+     v_display_y2 = y2;
+     if (h != 0u) s_d24_prev_disp_h = h;
+@@ -8345,6 +8452,8 @@ static void gp1_display_mode(uint32_t val) {
+     if (new_depth != display_depth)
+         s_d24_upload_x1 = 0; /* rising/falling: drop stale coverage */
+     display_depth = new_depth;
++    if (psx_video_timing_hardware())
++        hw_sync_wrap();   /* a passed wrap used the old interlace bit */
+     vertical_interlace = (val >> 5) & 1;
+     /* GPUSTAT.13 holds the legacy constant 0 in progressive (see the vblank
+      * field flip); clear it on the switch so a title that toggles interlace
+diff --git a/runtime/src/interrupts.c b/runtime/src/interrupts.c
+index 4328e1cc..196b87c5 100644
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -493,6 +493,7 @@ static void fire_vblank_edge(void) {
+      * carries forward. Prevents long-running blocks from rounding multiple
+      * VBlanks together. */
+     psx_vblank_consume_edge(&cycles_since_vblank);
++    psx_video_timing_frame_edge();
+     dispatch_count = 0;
+     /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled one period out. */
+     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
+@@ -919,6 +920,9 @@ void interrupts_init(void) {
+     exception_entries_total = 0;
+     exception_reentry_blocks = 0;
+     cycles_since_vblank = 0;
++    /* Hardware frame period (Tekken 2 patch 0009): the first VBlank comes
++     * when the beam first reaches GP1(07h) Y2, not a whole frame in. */
++    { extern void gpu_hw_crtc_power_on(void); gpu_hw_crtc_power_on(); }
+     /* Rematch / session_reboot re-enters bring-up without process exit.
+      * Stale I_STAT/I_MASK from the prior match (e.g. VBlank pending + game
+      * mask) makes boot take a phantom IRQ at ~cycle 4 and wedge under
+diff --git a/runtime/src/psx_video_timing.c b/runtime/src/psx_video_timing.c
+index c0087070..eacc0d4e 100644
+--- a/runtime/src/psx_video_timing.c
++++ b/runtime/src/psx_video_timing.c
+@@ -1,5 +1,9 @@
+ #include "psx_video_timing.h"
+ 
++#include "execution_profile.h"
++
++#include <stdlib.h>
++
+ uint32_t g_psx_vblank_cycles   = PSX_VBLANK_CYCLES_NTSC;
+ uint32_t g_psx_hblank_cycles   = PSX_HBLANK_CYCLES_NTSC;
+ uint32_t g_psx_lines_per_frame = PSX_LINES_PER_FRAME_NTSC;
+@@ -7,18 +11,123 @@ uint32_t g_psx_lines_per_frame = PSX_LINES_PER_FRAME_NTSC;
+ static int      s_pal;
+ static uint32_t s_generation;
+ 
++/* ---- hardware frame period (Tekken 2 patch 0009) ----
++ *
++ * The round constants make an NTSC frame 564480 CPU cycles (60 Hz). On the
++ * console the frame is 263 scanlines of 3413 video clocks (PAL 314 of 3406,
++ * PSX-SPX "GPU Timings"), and the video clock is not a whole multiple of the
++ * CPU clock: NTSC 53.693175 MHz, PAL 53.203425 MHz against 33.8688 MHz, the
++ * values DuckStation ffb33c28 uses (GPU::GetCRTCFrequency), so an NTSC frame
++ * is 897619 * 451584 / 715909 = 566203.78 CPU cycles (59.82 Hz) and a PAL
++ * frame 1069484 * 451584 / 709379 = 680823.46. The 0.3% gap gave the guest
++ * 1724 fewer cycles a frame than DuckStation and the console, so CD sectors
++ * (paced in CPU cycles) and CPU-bound work ran into later VBlanks: Tekken 2's
++ * VBlank counter was 5 ahead of DuckStation's by round 1 (issue #437).
++ *
++ * The period alternates between floor and floor + 1 so that the frame edges
++ * stay on the exact rational grid. Timer 1's HBlank clock becomes one
++ * scanline, truncated (NTSC 2152, PAL 2168).
++ *
++ * On by default in the REFERENCE execution profile, off in ENHANCED (which
++ * keeps the 60/50 Hz constants bit for bit); PSX_VIDEO_TIMING=1 or =0
++ * overrides either default. */
++
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define PSX_VIDEO_TIMING_DEFAULT 1
++#else
++#define PSX_VIDEO_TIMING_DEFAULT 0
++#endif
++
++#define CPU_PER_CRTC_NUM        451584ull   /* 33868800 / 75 */
++#define CRTC_NTSC_DEN           715909u     /* 53693175 / 75 */
++#define CRTC_PAL_DEN            709379u     /* 53203425 / 75 */
++#define CRTC_NTSC_LINE          3413u
++#define CRTC_PAL_LINE           3406u
++
++static int      s_hw = -1;
++static int      s_hw_applied;
++static uint32_t s_frac;        /* remainder of the rational frame grid */
++
++int psx_video_timing_hardware(void) {
++    if (s_hw < 0) {
++        const char *e = getenv("PSX_VIDEO_TIMING");
++        s_hw = (e && (e[0] == '0' || e[0] == '1')) ? (e[0] == '1')
++                                                   : PSX_VIDEO_TIMING_DEFAULT;
++    }
++    return s_hw;
++}
++
++void psx_video_timing_set_hardware(int on) {
++    s_hw = on < 0 ? -1 : (on != 0);
++    s_hw_applied = 0;
++    s_frac = 0;
++}
++
++static uint64_t hw_frame_num(void) {
++    return s_pal ? (uint64_t)PSX_LINES_PER_FRAME_PAL * CRTC_PAL_LINE * CPU_PER_CRTC_NUM
++                 : (uint64_t)PSX_LINES_PER_FRAME_NTSC * CRTC_NTSC_LINE * CPU_PER_CRTC_NUM;
++}
++
++static uint32_t hw_frame_den(void) {
++    return s_pal ? CRTC_PAL_DEN : CRTC_NTSC_DEN;
++}
++
++/* Period of the frame starting now: floor, plus one when the fraction wraps. */
++static uint32_t hw_next_period(void) {
++    const uint64_t num = hw_frame_num();
++    const uint32_t den = hw_frame_den();
++    uint32_t cycles = (uint32_t)(num / den);
++    uint64_t frac = (uint64_t)s_frac + num % den;
++    if (frac >= den) {
++        frac -= den;
++        cycles++;
++    }
++    s_frac = (uint32_t)frac;
++    return cycles;
++}
++
++static void apply_standard(void) {
++    if (psx_video_timing_hardware()) {
++        s_frac = 0;
++        g_psx_vblank_cycles   = hw_next_period();
++        g_psx_hblank_cycles   = (uint32_t)(((s_pal ? CRTC_PAL_LINE : CRTC_NTSC_LINE) *
++                                            CPU_PER_CRTC_NUM) / hw_frame_den());
++        s_hw_applied = 1;
++    } else {
++        g_psx_vblank_cycles   = s_pal ? PSX_VBLANK_CYCLES_PAL   : PSX_VBLANK_CYCLES_NTSC;
++        g_psx_hblank_cycles   = s_pal ? PSX_HBLANK_CYCLES_PAL   : PSX_HBLANK_CYCLES_NTSC;
++    }
++    g_psx_lines_per_frame = s_pal ? PSX_LINES_PER_FRAME_PAL : PSX_LINES_PER_FRAME_NTSC;
++}
++
+ int psx_video_timing_set_pal(int pal) {
+     pal = pal ? 1 : 0;
+-    if (pal == s_pal)
++    if (pal == s_pal) {
++        if (!s_hw_applied && psx_video_timing_hardware())
++            apply_standard();   /* first report: start the hardware grid */
+         return 0;
++    }
+     s_pal = pal;
+-    g_psx_vblank_cycles   = pal ? PSX_VBLANK_CYCLES_PAL   : PSX_VBLANK_CYCLES_NTSC;
+-    g_psx_hblank_cycles   = pal ? PSX_HBLANK_CYCLES_PAL   : PSX_HBLANK_CYCLES_NTSC;
+-    g_psx_lines_per_frame = pal ? PSX_LINES_PER_FRAME_PAL : PSX_LINES_PER_FRAME_NTSC;
++    apply_standard();
+     s_generation++;
+     return 1;
+ }
+ 
++double psx_video_timing_line_cycles(void) {
++    return s_pal ? (double)CRTC_PAL_LINE * (double)CPU_PER_CRTC_NUM / (double)CRTC_PAL_DEN
++                 : (double)CRTC_NTSC_LINE * (double)CPU_PER_CRTC_NUM / (double)CRTC_NTSC_DEN;
++}
++
++void psx_video_timing_frame_edge(void) {
++    if (!psx_video_timing_hardware())
++        return;
++    if (!s_hw_applied) {
++        apply_standard();
++        return;
++    }
++    g_psx_vblank_cycles = hw_next_period();
++}
++
+ int psx_video_timing_is_pal(void) {
+     return s_pal;
+ }
+@@ -26,3 +135,41 @@ int psx_video_timing_is_pal(void) {
+ uint32_t psx_video_timing_generation(void) {
+     return s_generation;
+ }
++
++/* ---- CRTC beam arithmetic (gpu.c's hardware CRTC position) ---- */
++
++void psx_crtc_wrap(uint32_t *field, uint32_t *bit13, int interlace) {
++    if (interlace) {
++        *field ^= 1u;
++        *bit13 = *field ^ 1u;
++    } else {
++        *field = 0u;
++        *bit13 = 0u;
++    }
++}
++
++static uint32_t crtc_clamp(uint32_t y, uint32_t total) { return y < total ? y : total; }
++
++uint32_t psx_crtc_status_bits(const PsxCrtcBeam *b, double raw) {
++    uint32_t field = b->field, bit13 = b->bit13;
++    if (!b->wrap_done && raw >= (double)b->total)
++        psx_crtc_wrap(&field, &bit13, b->interlace);   /* the wrap the beam has passed */
++    const uint32_t line = (uint32_t)(raw >= (double)b->total ? raw - (double)b->total : raw);
++    const int in_vblank = line < crtc_clamp(b->y1, b->total) || line >= crtc_clamp(b->y2, b->total);
++    uint32_t lsb;
++    if (b->interlace && b->vres480)
++        lsb = (b->disp_y + ((in_vblank ? 0u : 1u) & b->dfield)) & 1u;
++    else
++        lsb = (b->disp_y + line) & 1u;
++    return (bit13 << 13) | (lsb << 31);
++}
++
++double psx_crtc_lines_to_vblank(double pos, uint32_t y1, uint32_t old_y2, uint32_t new_y2,
++                                uint32_t total) {
++    const double ny2 = (double)crtc_clamp(new_y2, total);
++    const int in_vblank = pos < (double)crtc_clamp(y1, total) || pos >= (double)crtc_clamp(old_y2, total);
++    if (!in_vblank && pos >= ny2) return 0.0;
++    double to_go = ny2 - pos;
++    if (to_go <= 0.0) to_go += (double)total;
++    return to_go;
++}
+diff --git a/runtime/tests/test_vblank_alignment.c b/runtime/tests/test_vblank_alignment.c
+new file mode 100644
+index 00000000..a9f9e4c6
+--- /dev/null
++++ b/runtime/tests/test_vblank_alignment.c
+@@ -0,0 +1,130 @@
++/* Tekken 2 patch 0009: the hardware frame period, the CRTC beam that drives
++ * GPUSTAT bits 13 and 31 and the VBlank edge, and the SPU DMA write time.
++ * Values from PSX-SPX "GPU Timings" (263 x 3413 / 314 x 3406 video clocks)
++ * and DuckStation ffb33c28 (video clock 53.693175 / 53.203425 MHz; SPU DMA
++ * measured on Tekken 2's uploads). */
++
++#include "psx_video_timing.h"
++#include "spu_dma_timing.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifdef _WIN32
++#define setenv(k, v, o) _putenv_s((k), (v))
++#define unsetenv(k) _putenv_s((k), "")
++#endif
++
++static int s_fail, s_checks;
++
++static void check(int ok, const char *what, double got, double want) {
++    s_checks++;
++    if (!ok) {
++        s_fail++;
++        fprintf(stderr, "FAIL %s: got %.4f, want %.4f\n", what, got, want);
++    }
++}
++
++/* The OpenBIOS shell's waitVSync for interlace (shell/gpu.c): returns at the
++ * first beam position where (bit31, bit13) = (1, 0) when lastField is 0, or
++ * (0, 1) when it is 1. Scans one frame from `from` in quarter lines. */
++static double shell_wait(const PsxCrtcBeam *b, double from, int last_field) {
++    for (double r = from; r < from + b->total; r += 0.25) {
++        const uint32_t v = psx_crtc_status_bits(b, r);
++        const int even = (v >> 31) == 0, mask_even = ((v >> 13) & 1u) == 0;
++        if (last_field && even && !mask_even) return r;
++        if (!last_field && !even && mask_even) return r;
++    }
++    return -1.0;
++}
++
++int main(void) {
++    /* Frame period: 60/50 Hz constants with the model off. */
++    psx_video_timing_set_hardware(0);
++    (void)psx_video_timing_set_pal(0);
++    check(g_psx_vblank_cycles == 564480u, "off: ntsc period", g_psx_vblank_cycles, 564480);
++
++    /* On: NTSC 897619 * 451584 / 715909 cycles a frame, alternating floor
++     * and floor + 1 on the exact grid; hblank one line, truncated. */
++    psx_video_timing_set_hardware(1);
++    psx_video_timing_frame_edge();          /* first report starts the grid */
++    {
++        unsigned long long sum = 0;
++        for (int i = 0; i < 715909; i++) {
++            sum += g_psx_vblank_cycles;
++            psx_video_timing_frame_edge();
++        }
++        check(sum == 897619ull * 451584ull, "ntsc grid over 715909 frames", (double)sum,
++              897619.0 * 451584.0);
++    }
++    check(g_psx_vblank_cycles == 566203u || g_psx_vblank_cycles == 566204u, "ntsc period",
++          g_psx_vblank_cycles, 566204);
++    check(g_psx_hblank_cycles == 2152u, "ntsc hblank", g_psx_hblank_cycles, 2152);
++    check(fabs(psx_video_timing_line_cycles() - 2152.866065) < 1e-5, "ntsc line",
++          psx_video_timing_line_cycles(), 2152.866065);
++    (void)psx_video_timing_set_pal(1);
++    check(g_psx_vblank_cycles == 680823u || g_psx_vblank_cycles == 680824u, "pal period",
++          g_psx_vblank_cycles, 680823);
++    check(g_psx_hblank_cycles == 2168u, "pal hblank", g_psx_hblank_cycles, 2168);
++    (void)psx_video_timing_set_pal(0);
++    psx_video_timing_set_hardware(-1);
++    unsetenv("PSX_VIDEO_TIMING");
++    check(psx_video_timing_hardware() == 0, "standalone default off", psx_video_timing_hardware(), 0);
++    setenv("PSX_VIDEO_TIMING", "1", 1);
++    psx_video_timing_set_hardware(-1);
++    check(psx_video_timing_hardware() == 1, "PSX_VIDEO_TIMING=1", psx_video_timing_hardware(), 1);
++    unsetenv("PSX_VIDEO_TIMING");
++
++    /* The wrap. */
++    {
++        uint32_t f = 0, b13 = 1;
++        psx_crtc_wrap(&f, &b13, 0);
++        check(f == 0 && b13 == 0, "wrap, interlace off", f * 10 + b13, 0);
++        psx_crtc_wrap(&f, &b13, 1);
++        check(f == 1 && b13 == 0, "wrap, interlace on", f * 10 + b13, 10);
++        psx_crtc_wrap(&f, &b13, 1);
++        check(f == 0 && b13 == 1, "wrap again", f * 10 + b13, 1);
++    }
++
++    /* OpenBIOS shell, 640x480i, display lines 16..255, area Y 2. A frame
++     * starts at its VBlank edge (line 255, raw 255) and wraps at raw 263.
++     * Frame A: field 0 at the edge, so the displayed field is 1: lastField 0
++     * returns at display start (line 16 after the wrap), as on DuckStation. */
++    {
++        PsxCrtcBeam a = { 263, 16, 255, 2, 1, 1, 0, 0, 1, 1 };
++        check(shell_wait(&a, 255.0, 0) == 279.0, "shell lastField 0: display start",
++              shell_wait(&a, 255.0, 0), 279.0);
++        /* Frame B: field 1 at the edge, displayed field 0: lastField 1
++         * returns at the wrap, when bit 13 turns 1. */
++        PsxCrtcBeam b = { 263, 16, 255, 2, 1, 1, 0, 1, 0, 0 };
++        check(shell_wait(&b, 255.0, 1) == 263.0, "shell lastField 1: the wrap",
++              shell_wait(&b, 255.0, 1), 263.0);
++        /* 240-line progressive: bit 31 is the scanline's parity, bit 13 0. */
++        PsxCrtcBeam p = { 263, 16, 256, 0, 0, 0, 0, 0, 0, 0 };
++        check(psx_crtc_status_bits(&p, 300.0) == (1u << 31), "progressive line 37",
++              psx_crtc_status_bits(&p, 300.0), (double)(1u << 31));
++        check(psx_crtc_status_bits(&p, 301.0) == 0u, "progressive line 38",
++              psx_crtc_status_bits(&p, 301.0), 0);
++    }
++
++    /* Moving Y2: from line 100 in the display area, Y2 256 -> 255 is 155
++     * lines ahead; Y2 -> 50 (already passed) is at once; from line 1 in
++     * vblank, Y2 256 -> 255 is 254 lines ahead. */
++    check(psx_crtc_lines_to_vblank(100.0, 16, 256, 255, 263) == 155.0, "Y2 ahead",
++          psx_crtc_lines_to_vblank(100.0, 16, 256, 255, 263), 155.0);
++    check(psx_crtc_lines_to_vblank(100.0, 16, 256, 50, 263) == 0.0, "Y2 passed",
++          psx_crtc_lines_to_vblank(100.0, 16, 256, 50, 263), 0.0);
++    check(psx_crtc_lines_to_vblank(1.0, 16, 256, 255, 263) == 254.0, "Y2 from vblank",
++          psx_crtc_lines_to_vblank(1.0, 16, 256, 255, 263), 254.0);
++
++    /* SPU DMA write: the two transfers measured on DuckStation. */
++    check(abs((int)dma_spu_write_cycles(29216) - 920756) <= 2, "spu dma 29216 words",
++          dma_spu_write_cycles(29216), 920756);
++    check(abs((int)dma_spu_write_cycles(44240) - 1394480) <= 2, "spu dma 44240 words",
++          dma_spu_write_cycles(44240), 1394480);
++    check(dma_spu_write_cycles(16) == 43u, "spu dma one block", dma_spu_write_cycles(16), 43);
++
++    printf("vblank_alignment_test: %d checks, %d failed\n", s_checks, s_fail);
++    return s_fail ? 1 : 0;
++}

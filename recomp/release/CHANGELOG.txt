@@ -1,0 +1,27 @@
+Tekken 2 Recompiled changelog
+=============================
+
+0.1.0 (first release)
+---------------------
+
+The first release of Tekken 2 Recompiled, a native Mac and Windows
+version of Namco's Tekken 2 for the PlayStation.
+
+- Plays Tekken 2 (USA) (Rev 1) from your own BIN/CUE disc image, started
+  with the included OpenBIOS. The first start asks for the disc and
+  remembers it.
+- Mac: an app for Apple silicon Macs, macOS 11 or later.
+- Windows: a 64-bit app for Windows 10 and 11 that keeps its settings and
+  memory cards in your user folder, not in the install folder.
+- Every connected controller and the keyboard work at once, with hot-plug.
+  PlayStation controllers map one to one; other controllers map by button
+  position.
+- A settings panel (Select held for a second, F1 or Esc): each player's
+  controls, swapping players, internal resolution, fullscreen, audio
+  latency, an FPS display, and the mode.
+- Two modes: Enhanced, the default, loads faster and never drops frames;
+  Original keeps the PlayStation's loading times and slowdowns.
+- Fullscreen with F11, Alt+Enter or a double-click on the picture.
+- The 3D fighters draw correctly: a fix in the recompiler for a
+  coprocessor load inside a branch delay slot, which had stretched the
+  character models into spikes.

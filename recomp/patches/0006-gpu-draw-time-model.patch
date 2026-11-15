@@ -1,0 +1,1364 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index d74b36e6..427db148 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -838,6 +838,7 @@ if(BUILD_TESTING)
+             src/memory.c
+             src/dma.c
+             src/gpu_timeline.c
++            src/gpu_timing.c
+             src/boot_state.c
+             src/mod_snapshot.c
+             src/psx_ram_geometry.c)
+@@ -860,6 +861,7 @@ if(BUILD_TESTING)
+             src/memory.c
+             src/dma.c
+             src/gpu_timeline.c
++            src/gpu_timing.c
+             src/boot_state.c
+             src/mod_snapshot.c
+             src/psx_icache.c
+@@ -884,6 +886,7 @@ if(BUILD_TESTING)
+             src/memory.c
+             src/dma.c
+             src/gpu_timeline.c
++            src/gpu_timing.c
+             src/boot_state.c
+             src/mod_snapshot.c
+             src/pgxp.cpp
+diff --git a/runtime/include/dma_gpu_ll.h b/runtime/include/dma_gpu_ll.h
+index 7454a90e..9154815b 100644
+--- a/runtime/include/dma_gpu_ll.h
++++ b/runtime/include/dma_gpu_ll.h
+@@ -29,6 +29,14 @@ typedef struct {
+     uint32_t max_nodes;
+     uint32_t total_words;
+     uint32_t empty_rank;
++    /* GPU draw time (Tekken 2 patch 0006). Not in savestates; all zero when
++     * the timing model is off, which keeps the walk exactly as before. */
++    uint8_t  waiting;          /* the next payload word waits for the GPU FIFO */
++    uint8_t  stop_on_wait;     /* advance returns instead of consuming a wait */
++    uint32_t header_cost_x4;   /* header read cost in quarter cycles; 0 = 1 cycle */
++    uint32_t header_frac_x4;
++    uint32_t call_consumed;    /* cycles consumed by the current advance call */
++    uint32_t active_cycles;    /* cycles spent moving words (not waiting) */
+ } DMAGPULinkedList;
+ 
+ typedef struct {
+@@ -38,11 +46,16 @@ typedef struct {
+     int (*begin_node)(void *opaque, uint32_t address, uint32_t word_count);
+     void (*emit_word)(void *opaque, uint32_t address, uint32_t word);
+     void (*complete)(void *opaque, int hit_limit);
++    /* Optional: guest cycles a payload word must wait for the GPU; first_word
++     * is set for a node's first word (the DMA request: FIFO empty). */
++    uint32_t (*gate)(void *opaque, int first_word);
+ } DMAGPULinkedListOps;
+ 
+ void dma_gpu_ll_start(DMAGPULinkedList *state, uint32_t start_addr,
+                       uint32_t max_nodes);
+ void dma_gpu_ll_cancel(DMAGPULinkedList *state);
++/* Header read cost in quarter cycles for the walk just started (default 4). */
++void dma_gpu_ll_set_header_cost(DMAGPULinkedList *state, uint32_t cost_x4);
+ uint32_t dma_gpu_ll_cycles_to_event(const DMAGPULinkedList *state);
+ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+                         const DMAGPULinkedListOps *ops, void *opaque);
+diff --git a/runtime/include/gpu_timing.h b/runtime/include/gpu_timing.h
+new file mode 100644
+index 00000000..0493fc20
+--- /dev/null
++++ b/runtime/include/gpu_timing.h
+@@ -0,0 +1,80 @@
++#ifndef PSXRECOMP_GPU_TIMING_H
++#define PSXRECOMP_GPU_TIMING_H
++
++/* GPU draw-time model (Tekken 2 patch 0006). See gpu_timing.c.
++ *
++ * When enabled, every GP0 command takes guest time: GPUSTAT bit 26 (ready for
++ * a command) stays clear while the GPU draws, bit 28 (write FIFO empty) while
++ * received commands wait in the 16-word FIFO, and DMA2 waits for the FIFO the
++ * way the hardware's DMA request does. Disabled, the GPU is ready at once, as
++ * psxrecomp always modelled it.
++ *
++ * On by default in the REFERENCE execution profile, off in ENHANCED.
++ * PSX_GPU_TIMING=1 or =0 overrides either default. */
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Draw state that changes what a command costs. Coordinates are VRAM
++ * pixels; the drawing area is inclusive, as GP0(E3h)/GP0(E4h) give it. */
++typedef struct {
++    int32_t area_left, area_top, area_right, area_bottom;
++    int32_t offset_x, offset_y;
++    uint8_t tex_depth;       /* GP0(E1h) bits 7-8: 0 4bpp, 1 8bpp, 2 15bpp */
++    uint8_t mask_check;      /* GP0(E6h) bit 1 */
++} GpuTimingDrawState;
++
++/* GPU ticks are half a CPU cycle. */
++#define GPU_TIMING_TICKS_PER_CYCLE 2u
++/* PSX-SPX graphicsprocessingunitgpu, "GPU I/O Ports...": "It (=GP0 only?) has
++ * a 64-byte (16-word) command FIFO buffer." */
++#define GPU_TIMING_FIFO_WORDS 16u
++
++int  gpu_timing_enabled(void);
++void gpu_timing_set_enabled(int on);       /* tests and tools; -1 = default */
++
++/* Draw time of one complete GP0 command in GPU ticks. 0 for commands that
++ * draw nothing (environment, NOP, VRAM transfer headers). */
++uint32_t gpu_timing_command_ticks(const GpuTimingDrawState *st,
++                                  const uint32_t *words, uint32_t nwords);
++/* One polyline segment, (x0,y0)-(x1,y1) with the offset already applied. */
++uint32_t gpu_timing_line_ticks(const GpuTimingDrawState *st, int32_t x0,
++                               int32_t y0, int32_t x1, int32_t y1);
++
++/* Queue state. `now` is the guest cycle at which the word or command arrives.
++ * A command's words enter the FIFO as they arrive (word) and leave it when
++ * the GPU starts the command (command, with its draw time). */
++void gpu_timing_reset(void);
++void gpu_timing_clear_fifo(uint64_t now);  /* GP1(01h) */
++void gpu_timing_word(uint64_t now);
++void gpu_timing_command(uint64_t now, uint32_t ticks);
++/* The guest cycle GP0 words arrive at: `fallback` (the CPU's clock) unless
++ * a DMA transfer has set the time of the word it is delivering. */
++void     gpu_timing_set_clock(uint64_t now);
++void     gpu_timing_clear_clock(void);
++uint64_t gpu_timing_clock(uint64_t fallback);
++
++int      gpu_timing_idle(uint64_t now);          /* GPUSTAT bit 26 */
++int      gpu_timing_fifo_empty(uint64_t now);    /* GPUSTAT bit 28 */
++int      gpu_timing_fifo_full(uint64_t now);
++/* Guest cycles until the FIFO is empty (the DMA request in GP1(04h)=2 mode)
++ * or until it has room for one more word. 0 = now. */
++uint32_t gpu_timing_cycles_to_fifo_empty(uint64_t now);
++uint32_t gpu_timing_cycles_to_fifo_room(uint64_t now);
++uint32_t gpu_timing_cycles_to_idle(uint64_t now);
++
++typedef struct {
++    uint64_t commands;
++    uint64_t busy_ticks;        /* sum of command draw times */
++    uint64_t idle_reads;        /* GPUSTAT reads that saw the GPU busy */
++} GpuTimingStats;
++void gpu_timing_get_stats(GpuTimingStats *out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/runtime/include/psx_cycles.h b/runtime/include/psx_cycles.h
+index 12dad9db..9fa7294e 100644
+--- a/runtime/include/psx_cycles.h
++++ b/runtime/include/psx_cycles.h
+@@ -16,6 +16,10 @@ extern uint64_t psx_cycle_count;
+  * reads these from the inlined psx_advance_cycles below. */
+ extern uint64_t psx_next_service_cycle; /* absolute; 0 = dirty / recompute */
+ extern int      psx_in_device_service;  /* re-entrancy guard */
++/* Devices that halt the CPU (timed GPU DMA, Tekken 2 patch 0006) report the
++ * halted cycles here; psx_devices_service_to_now adds them to the guest clock.
++ * NULL unless set. */
++extern uint32_t (*psx_device_cpu_stall_hook)(void);
+ extern int      g_event_step_conservative;
+ 
+ /* Diagnostic replay clock: advance the CPU-visible guest clock without
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 65d4d018..deacf118 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -398,6 +398,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/kernel_patch_ranges.c
+     ${PSXRECOMP_ROOT}/runtime/src/guest_tty.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu.c
++    ${PSXRECOMP_ROOT}/runtime/src/gpu_timing.c
+     ${PSXRECOMP_ROOT}/runtime/src/ws_ui_group.c
+     ${PSXRECOMP_ROOT}/runtime/src/ws_aspect_cone_math.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
+@@ -3075,3 +3076,15 @@ function(psxrecomp_add_game_runtime target)
+         target_include_directories(${_psxg_t} PRIVATE ${_psxg_inc})
+     endforeach()
+ endfunction()
++
++# GPU draw-time model (Tekken 2 patch 0006): measured primitive costs, the
++# FIFO and the DMA request. Registered once, in whichever project includes
++# this file (a game's build or the runtime's own).
++if(BUILD_TESTING AND NOT TARGET gpu_timing_test)
++    add_executable(gpu_timing_test
++        ${PSXRECOMP_ROOT}/runtime/tests/test_gpu_timing.c
++        ${PSXRECOMP_ROOT}/runtime/src/gpu_timing.c)
++    target_include_directories(gpu_timing_test PRIVATE ${PSXRECOMP_ROOT}/runtime/include)
++    add_test(NAME gpu_timing_test COMMAND gpu_timing_test)
++    set_tests_properties(gpu_timing_test PROPERTIES ENVIRONMENT "PSX_GPU_TIMING=")
++endif()
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index 8a9faab4..2f40e74e 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -19,6 +19,7 @@
+ #include "dma_gpu_ll.h"
+ #include "dma_host_draw.h"
+ #include "gpu.h"
++#include "gpu_timing.h"
+ #include "mdec.h"
+ #include "mod_memory.h"
+ #include "overlay_capture.h"
+@@ -802,10 +803,80 @@ static int gpu_ll_begin_node(void *opaque, uint32_t addr, uint32_t num_words) {
+     return 1;
+ }
+ 
++/* GPU draw time (gpu_timing.c; Tekken 2 patch 0006). The walker's events
++ * run inside an advance call that covers [s_ll_call_base, +cycles]; a word's
++ * guest time is that base plus what the walker has consumed so far, plus any
++ * cycles a timed burst already ran the walker ahead of the device clock.
++ * s_ll_ahead: walker time already spent beyond the device clock (a burst);
++ * s_cpu_stall: guest cycles the CPU was halted by a burst, charged by
++ * psx_devices_service_to_now (dma_take_cpu_stall). */
++static uint64_t s_ll_call_base;
++static uint32_t s_ll_ahead;
++static uint32_t s_cpu_stall;
++static int      s_ll_holding;
++/* A linked-list node header: 8.75 cycles, measured on the DuckStation
++ * reference (recomp/tools/gpu_timing, "ll 1024 empty nodes"). */
++#define DMA_GPU_LL_TIMED_HEADER_X4 35u
++/* Timed walk pacing (REFERENCE; Tekken 2 patch 0006, amended for the VBlank
++ * alignment work): the DMA runs a list in slices of at most 1,000 cycles with
++ * the CPU halted, and the CPU then runs 100 cycles before the next slice, as
++ * DuckStation ffb33c28 does (dma_max_slice_ticks / dma_halt_ticks; PSX-SPX
++ * dmachannels has the CPU halted while DMA moves data but gives no slice).
++ * Holding the CPU for a whole list instead froze guest interrupts for 3.3
++ * frames on Tekken 2's first scene, which kicks DrawOTag on an OT it has not
++ * cleared yet: the list loops at address 0 until the next DrawOTag replaces
++ * it (also as on DuckStation: a kick while a list runs restarts the walk at
++ * the new MADR). */
++#define DMA_GPU_LL_SLICE_CYCLES 1000u
++#define DMA_GPU_LL_HALT_CYCLES  100u
++static uint32_t s_ll_cpu_run;   /* CPU cycles since the last slice */
++
++static int gpu_ll_timed(void) {
++    return gpu_timing_enabled() && !g_psx_render_pass_active;
++}
++
++static uint64_t gpu_ll_now(void) {
++    return s_ll_call_base + gpu_linked_list.call_consumed;
++}
++
+ static void gpu_ll_emit_word(void *opaque, uint32_t address, uint32_t word) {
+     (void)opaque;
+     gpu_set_gp0_source(address);
+-    gpu_write_gp0(word);
++    if (gpu_ll_timed()) {
++        gpu_timing_set_clock(gpu_ll_now());
++        gpu_write_gp0(word);
++        gpu_timing_clear_clock();
++    } else {
++        gpu_write_gp0(word);
++    }
++}
++
++/* PSX-SPX dmachannels, "CPU Operation during DMA" and graphicsprocessingunitgpu,
++ * "GPUSTAT" bit 25: with GP1(04h)=2 the DMA request is "write FIFO empty", so a
++ * node's words start only once the FIFO has drained; later words of the same
++ * node wait for room in the 16-word FIFO. */
++static uint32_t gpu_ll_gate(void *opaque, int first_word) {
++    (void)opaque;
++    if (!gpu_ll_timed()) return 0;
++    const uint64_t now = gpu_ll_now();
++    return first_word ? gpu_timing_cycles_to_fifo_empty(now)
++                      : gpu_timing_cycles_to_fifo_room(now);
++}
++
++static uint32_t gpu_ll_cycles_to_event(void) {
++    uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
++    /* Timed walk between slices: the next slice comes after the CPU's turn. */
++    if (d != UINT32_MAX && gpu_ll_timed() && !s_ll_holding && !gpu_linked_list.waiting)
++        d = s_ll_cpu_run >= DMA_GPU_LL_HALT_CYCLES ? 1u : DMA_GPU_LL_HALT_CYCLES - s_ll_cpu_run;
++    /* (a slice already run ahead of the device clock elapses first) */
++    if (d == UINT32_MAX || !s_ll_ahead) return d;
++    return d > UINT32_MAX - s_ll_ahead ? UINT32_MAX : d + s_ll_ahead;
++}
++
++static uint32_t dma_take_cpu_stall(void) {
++    uint32_t c = s_cpu_stall;
++    s_cpu_stall = 0;
++    return c;
+ }
+ 
+ static void gpu_ll_complete(void *opaque, int hit_limit) {
+@@ -826,13 +897,17 @@ static const DMAGPULinkedListOps gpu_ll_ops = {
+     gpu_ll_observe_header,
+     gpu_ll_begin_node,
+     gpu_ll_emit_word,
+-    gpu_ll_complete
++    gpu_ll_complete,
++    gpu_ll_gate
+ };
+ 
+ static void start_async_gpu_linked_list(void) {
+     if (gpu_linked_list.active) {
+         gpu_ot_stats.starts_dropped++;
+-        return;
++        if (!gpu_ll_timed()) return;
++        /* Timed (DuckStation's behaviour): the walk restarts at the new MADR. */
++        dma_gpu_ll_cancel(&gpu_linked_list);
++        s_ll_ahead = 0;
+     }
+     uint32_t start_addr = psx_mod_gpu_dma_resolve_address(channels[2].madr);
+     gpu_ws_begin_linked_list();
+@@ -841,6 +916,9 @@ static void start_async_gpu_linked_list(void) {
+      * header and payload read at its consumption boundary. */
+     gpu_ws_prepass_linked_list(start_addr);
+     dma_gpu_ll_start(&gpu_linked_list, start_addr, 0x40000u);
++    s_ll_ahead = 0;
++    if (gpu_ll_timed())
++        dma_gpu_ll_set_header_cost(&gpu_linked_list, DMA_GPU_LL_TIMED_HEADER_X4);
+     gpu_timeline_note(GTL_LL_START, start_addr, 0);
+     event_ring_record_aux(EV_DMA_SCHED, 2u, channels[2].chcr);
+     gpu_ot_stats.starts++;
+@@ -892,9 +970,15 @@ static void hold_cpu_for_gpu_linked_list(void) {
+     const uint64_t host0 = hold_host_ticks();
+     const uint32_t words0 = gpu_linked_list.total_words;
+     uint32_t steps = 0;
++    s_ll_holding = 1;
+     while (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
+            channel_enabled(2)) {
++        /* Timed GPU: one slice, then the CPU's turn (DMA_GPU_LL_SLICE_CYCLES). */
++        if (gpu_ll_timed() && psx_cycle_count - cyc0 >= DMA_GPU_LL_SLICE_CYCLES) break;
+         const uint32_t moved = gpu_linked_list.total_words;
++        /* Timed GPU: the CPU runs while the DMA waits for the GPU FIFO. */
++        if (gpu_linked_list.waiting) break;
++        s_ll_call_base = psx_cycle_count;
+         if((s_host_draw[0].bytes || s_host_draw[1].bytes) &&
+            dma_host_draw_drain(&gpu_linked_list,s_host_draw,&gpu_ll_ops,NULL)) {
+             ++s_host_draw_nodes;s_host_draw_words+=gpu_linked_list.total_words-moved;
+@@ -905,6 +989,8 @@ static void hold_cpu_for_gpu_linked_list(void) {
+         steps++;
+         if (gpu_linked_list.active && gpu_linked_list.total_words == moved) break;
+     }
++    s_ll_holding = 0;
++    s_ll_cpu_run = 0;
+     const uint64_t host_us = (hold_host_ticks() - host0) * 1000000ull /
+                              hold_host_ticks_per_sec();
+     const int in_exc = psx_get_in_exception() != 0;
+@@ -938,6 +1024,27 @@ void dma_debug_get_gpu_hold(DMAGpuHoldStats *out_stats,
+     if (out_ring) *out_ring = s_hold_ring;
+ }
+ 
++/* Timed GPU block and burst transfers (RAM to GP0): words go at 1 cycle each
++ * plus 2 cycles per 16 (measured on the DuckStation reference: 288 cycles for
++ * 256 words; PSX-SPX dmachannels, "DRAM Hyper Page mode", gives about 17
++ * clocks per 16 words), starting once the GPU FIFO is empty. */
++static int      s_ch2_timed;
++static uint64_t s_ch2_timed_base;
++
++static uint32_t ch2_timed_cycles(uint32_t words) {
++    return words + ((words + 15u) / 16u) * 2u;
++}
++
++static void ch2_feed(uint32_t word, uint32_t i) {
++    if (s_ch2_timed) {
++        gpu_timing_set_clock(s_ch2_timed_base + ch2_timed_cycles(i));
++        gpu_write_gp0(word);
++        gpu_timing_clear_clock();
++    } else {
++        gpu_write_gp0(word);
++    }
++}
++
+ static uint32_t execute_ch2_gpu(void) {
+     uint32_t chcr = channels[2].chcr;
+     uint32_t direction = chcr & 1;           /* 0=to RAM, 1=from RAM (to device) */
+@@ -977,7 +1084,7 @@ static uint32_t execute_ch2_gpu(void) {
+         for (uint32_t i = 0; i < total_words; i++) {
+             uint32_t word = psx_read_word(addr);
+             gpu_set_gp0_source(addr);
+-            gpu_write_gp0(word);
++            ch2_feed(word, i);
+             addr = DMA_RAM_ADDR((addr + addr_step));
+         }
+         channels[2].madr = addr;
+@@ -996,7 +1103,7 @@ static uint32_t execute_ch2_gpu(void) {
+         for (uint32_t i = 0; i < word_count; i++) {
+             uint32_t word = psx_read_word(addr);
+             gpu_set_gp0_source(addr);
+-            gpu_write_gp0(word);
++            ch2_feed(word, i);
+             addr = DMA_RAM_ADDR((addr + addr_step));
+         }
+         channels[2].madr = addr;
+@@ -1154,6 +1261,17 @@ static void try_execute(int ch) {
+                     dma_gpu_ll_advance(&gpu_linked_list, UINT32_MAX,
+                                        &gpu_ll_ops, NULL);
+                 hold_cpu_for_gpu_linked_list();
++            } else if (gpu_ll_timed() && (channels[2].chcr & 1u)) {
++                const uint32_t wait =
++                    gpu_timing_cycles_to_fifo_empty(psx_cycle_count);
++                s_ch2_timed = 1;
++                s_ch2_timed_base = psx_cycle_count + wait;
++                const uint32_t words = execute_ch2_gpu();
++                s_ch2_timed = 0;
++                schedule_delayed_complete(2, words, DMA_GPU_CYCLES_PER_WORD);
++                if (delayed_complete[2].active)
++                    delayed_complete[2].cycles_remaining =
++                        wait + ch2_timed_cycles(words);
+             } else {
+                 schedule_delayed_complete(2, execute_ch2_gpu(),
+                                           DMA_GPU_CYCLES_PER_WORD);
+@@ -1217,7 +1335,7 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
+         if (est < best) best = est;
+     }
+     if (gpu_linked_list.active) {
+-        uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
++        uint32_t d = gpu_ll_cycles_to_event();
+         if (d < best) best = d;
+     }
+     for (int ch = 0; ch < 7; ch++) {
+@@ -1275,7 +1393,7 @@ uint32_t dma_cycles_to_internal_event(void) {
+ 
+     if (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
+         channel_enabled(2)) {
+-        uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
++        uint32_t d = gpu_ll_cycles_to_event();
+         if (d < best) best = d;
+     }
+ 
+@@ -1303,7 +1421,7 @@ uint32_t dma_cycles_to_deliverable_irq(uint32_t i_mask) {
+         if (est < best) best = est;
+     }
+     if (channel_irq_flag_armed(2) && gpu_linked_list.active) {
+-        uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
++        uint32_t d = gpu_ll_cycles_to_event();
+         if (d < best) best = d;
+     }
+     for (int ch = 0; ch < 7; ch++) {
+@@ -1325,7 +1443,40 @@ void dma_advance(uint32_t cycles) {
+         g_dma_cur_madr = gpu_linked_list.current_addr;
+         g_dma_cur_bcr = channels[2].bcr;
+         g_dma_initiator_pc = s_dma_ch_initiator_pc[2];
+-        dma_gpu_ll_advance(&gpu_linked_list, cycles, &gpu_ll_ops, NULL);
++        uint32_t c = cycles;
++        if (s_ll_ahead) {                 /* a burst already ran this time */
++            uint32_t k = c < s_ll_ahead ? c : s_ll_ahead;
++            s_ll_ahead -= k;
++            c -= k;
++        }
++        if (c) {
++            const int sliced = gpu_ll_timed() && !s_ll_holding;
++            if (sliced) s_ll_cpu_run += c;
++            /* Sliced: the DMA is halted while the CPU runs, unless it is
++             * waiting for the GPU FIFO, which drains meanwhile. */
++            if (!sliced || gpu_linked_list.waiting) {
++                s_ll_call_base = psx_cycle_count - c;
++                dma_gpu_ll_advance(&gpu_linked_list, c, &gpu_ll_ops, NULL);
++            }
++        }
++        /* Timed GPU, CPU not held: once the FIFO has room and the CPU has had
++         * its turn, the DMA runs the next slice and the CPU stops for it
++         * (PSX-SPX dmachannels, "CPU Operation during DMA"). Run that slice
++         * now, ahead of the device clock, and charge it to the CPU. */
++        if (!s_ll_holding && gpu_ll_timed() && gpu_linked_list.active &&
++            !gpu_linked_list.waiting && s_ll_cpu_run >= DMA_GPU_LL_HALT_CYCLES &&
++            ((channels[2].chcr >> 24) & 1u) && channel_enabled(2)) {
++            const uint32_t a0 = gpu_linked_list.active_cycles;
++            s_ll_call_base = psx_cycle_count + s_ll_ahead;
++            gpu_linked_list.stop_on_wait = 1;
++            dma_gpu_ll_advance(&gpu_linked_list, DMA_GPU_LL_SLICE_CYCLES,
++                               &gpu_ll_ops, NULL);
++            gpu_linked_list.stop_on_wait = 0;
++            const uint32_t burst = gpu_linked_list.active_cycles - a0;
++            s_ll_ahead += burst;
++            s_cpu_stall += burst;
++            s_ll_cpu_run = 0;
++        }
+     }
+     DMAAsyncChannel *a = &cdrom_async;
+     if (dma_cdrom_transfer_active()) {
+@@ -1397,6 +1548,10 @@ void dma_init(void) {
+     memset(&cdrom_async, 0, sizeof(cdrom_async));
+     memset(&gpu_linked_list, 0, sizeof(gpu_linked_list));
+     memset(delayed_complete, 0, sizeof(delayed_complete));
++    s_ll_ahead = s_cpu_stall = 0;
++    s_ll_holding = 0;
++    s_ll_cpu_run = 0;
++    psx_device_cpu_stall_hook = gpu_timing_enabled() ? dma_take_cpu_stall : NULL;
+     dpcr = 0x07654321u; /* default: priorities set, no channels enabled */
+     dicr = 0;
+     dma_debug_clear_trace();
+diff --git a/runtime/src/dma_gpu_ll.c b/runtime/src/dma_gpu_ll.c
+index e102b03a..0e1320c3 100644
+--- a/runtime/src/dma_gpu_ll.c
++++ b/runtime/src/dma_gpu_ll.c
+@@ -9,6 +9,20 @@
+ #define DMA_GPU_LL_HEADER_CYCLES 1u
+ #define DMA_GPU_LL_SETUP_CYCLES  0u
+ 
++/* Header cost; quarter-cycle costs carry their remainder to the next header. */
++static uint32_t header_cycles(DMAGPULinkedList *state) {
++    uint32_t c4 = state->header_cost_x4 ? state->header_cost_x4
++                                        : 4u * DMA_GPU_LL_HEADER_CYCLES;
++    uint32_t total = state->header_frac_x4 + c4;
++    state->header_frac_x4 = total & 3u;
++    return total >> 2;
++}
++
++static void consume(DMAGPULinkedList *state, uint32_t cycles) {
++    state->call_consumed += cycles;
++    if (!state->waiting) state->active_cycles += cycles;
++}
++
+ static uint32_t resolve_address(const DMAGPULinkedListOps *ops, void *opaque,
+                                 uint32_t address) {
+     return ops->resolve_address ? ops->resolve_address(opaque, address) : address;
+@@ -39,6 +53,14 @@ void dma_gpu_ll_cancel(DMAGPULinkedList *state) {
+     memset(state, 0, sizeof(*state));
+ }
+ 
++void dma_gpu_ll_set_header_cost(DMAGPULinkedList *state, uint32_t cost_x4) {
++    state->header_cost_x4 = cost_x4;
++    state->header_frac_x4 = 0;
++    if (state->active && state->phase == DMA_GPU_LL_PHASE_HEADER &&
++        state->nodes_processed == 0)
++        state->cycles_remaining = header_cycles(state);
++}
++
+ uint32_t dma_gpu_ll_cycles_to_event(const DMAGPULinkedList *state) {
+     if (!state->active) return UINT32_MAX;
+     return state->cycles_remaining ? state->cycles_remaining : 1u;
+@@ -46,13 +68,16 @@ uint32_t dma_gpu_ll_cycles_to_event(const DMAGPULinkedList *state) {
+ 
+ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+                         const DMAGPULinkedListOps *ops, void *opaque) {
++    state->call_consumed = 0;
+     if (!state->active || cycles == 0 || !ops || !ops->read_word) return;
+     for (;;) {
+         if (cycles < state->cycles_remaining) {
+             state->cycles_remaining -= cycles;
++            consume(state, cycles);
+             return;
+         }
+         cycles -= state->cycles_remaining;
++        consume(state, state->cycles_remaining);
+         state->cycles_remaining = 0;
+ 
+         if (state->phase == DMA_GPU_LL_PHASE_HEADER) {
+@@ -91,7 +116,7 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+                 }
+                 state->current_addr = resolve_address(
+                     ops, opaque, state->next_addr);
+-                state->cycles_remaining = DMA_GPU_LL_HEADER_CYCLES;
++                state->cycles_remaining = header_cycles(state);
+             }
+         } else if (state->phase == DMA_GPU_LL_PHASE_SETUP) {
+             state->emit_node = ops->begin_node
+@@ -101,6 +126,16 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+             state->phase = DMA_GPU_LL_PHASE_PAYLOAD;
+             state->cycles_remaining = 1u;
+         } else if (state->phase == DMA_GPU_LL_PHASE_PAYLOAD) {
++            if (ops->gate && state->emit_node) {
++                uint32_t wait = ops->gate(opaque, state->payload_index == 0);
++                if (wait) {
++                    state->waiting = 1;
++                    state->cycles_remaining = wait;
++                    if (cycles == 0 || state->stop_on_wait) return;
++                    continue;
++                }
++            }
++            state->waiting = 0;
+             uint32_t word_addr = resolve_address(
+                 ops, opaque, state->current_addr + 4u +
+                              state->payload_index * 4u);
+@@ -121,7 +156,7 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+                 state->phase = DMA_GPU_LL_PHASE_HEADER;
+                 state->current_addr = resolve_address(
+                     ops, opaque, state->next_addr);
+-                state->cycles_remaining = DMA_GPU_LL_HEADER_CYCLES;
++                state->cycles_remaining = header_cycles(state);
+             }
+         } else {
+             state->hit_limit = 1;
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 829ae838..1036241f 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -57,6 +57,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "gpu_timeline.h"
++#include "gpu_timing.h"
++#include "psx_cycles.h"
++#include "psx_cycle_freeze.h"
+ 
+ /* Packet identity of a primitive/OT address: main RAM through the live
+  * geometry (retail: the DMAC's 0x1FFFFC fold), the enhancement aperture by its
+@@ -3880,6 +3883,20 @@ static uint16_t split_recent_display_h = 0;
+ 
+ /* Draw offset (set by GP0(E5h)) */
+ static int32_t draw_offset_x, draw_offset_y;
++
++/* ---- GPU draw time (gpu_timing.c; Tekken 2 patch 0006) ----
++ * Off unless gpu_timing_enabled() (REFERENCE profile, or PSX_GPU_TIMING=1).
++ * Render passes replay frozen guest time and never charge it. */
++static int gt_active(void) {
++    return !g_psx_render_pass_active && gpu_timing_enabled();
++}
++/* GP0(00h) and GP0(E3h..E5h) take no FIFO space (PSX-SPX
++ * graphicsprocessingunitgpu, "GP0(E3h..E5h)" and "GP0(00h)"). */
++static int gt_unqueued(uint8_t op) {
++    return op == 0x00u || (op >= 0xE3u && op <= 0xE5u);
++}
++static uint32_t s_gt_line_ticks;
++static int s_gt_line_pending;
+ /* Instrumentation: per-vblank range/count of GP0(E5) draw-offset-Y sets. If a
+  * single frame sets offsets in BOTH the top (y<128) and bottom (y>=128) buffer
+  * bands, the game is drawing different parts of the scene into different display
+@@ -4250,6 +4267,8 @@ static void gpu_reset_state(int clear_vram) {
+ 
+     gpuread_latch = 0;
+     gpustat_poll_count = 0;
++    gpu_timing_reset();
++    s_gt_line_pending = 0;
+     s_ws_fmv_frame_cache = 0xFFFFFFFFu;
+     s_ws_fmv_cached = 0;
+     ws_scene_hold_reset(&s_ws_scene_hold);
+@@ -4359,6 +4378,23 @@ uint32_t gpu_read_gpustat(void) {
+     /* Bit 28: ready to receive DMA block — 1 when not busy */
+     stat |= (1u << 28);
+ 
++    /* GPU draw time (gpu_timing.c): bit 26 clears while the GPU draws or
++     * wants parameters, bit 28 while commands wait in the FIFO, and bit 25
++     * follows the FIFO for DMA directions 1 and 2 (PSX-SPX
++     * graphicsprocessingunitgpu, "GPUSTAT" and "Ready Bits"). */
++    if (gt_active()) {
++        const uint64_t now = psx_cycle_count;
++        const int empty = gpu_timing_fifo_empty(now);
++        stat &= ~((1u << 25) | (1u << 26) | (1u << 28));
++        if (gp0_state == GP0_IDLE && gpu_timing_idle(now))
++            stat |= (1u << 26);
++        if (empty)
++            stat |= (1u << 28);
++        if ((dma_direction == 1 && !gpu_timing_fifo_full(now)) ||
++            (dma_direction == 2 && empty) || dma_direction == 3)
++            stat |= (1u << 25);
++    }
++
+     /* Bits 29-30: DMA direction */
+     stat |= (dma_direction & 3) << 29;
+ 
+@@ -7680,8 +7716,32 @@ uint64_t gpu_ws_census_seq(void) { return ws_census_seq; }
+ /* Execute a fully-collected GP0 command */
+ static void gp0_dispatch_command(uint8_t opcode);
+ 
++/* Tekken 2 differential trace GP0 draw-time log (difftrace.h, T2DIFF_GPULOG). */
++extern int difftrace_gpulog_on;
++void difftrace_gpu(uint32_t op, uint32_t ticks, uint64_t tick);
++
++static void gt_draw_state(GpuTimingDrawState *st) {
++    st->area_left = (int32_t)draw_area_left;
++    st->area_top = (int32_t)draw_area_top;
++    st->area_right = (int32_t)draw_area_right;
++    st->area_bottom = (int32_t)draw_area_bottom;
++    st->offset_x = draw_offset_x;
++    st->offset_y = draw_offset_y;
++    st->tex_depth = (uint8_t)(texpage_colors & 3u);
++    st->mask_check = (uint8_t)(check_mask_bit & 1u);
++}
++
+ static void gp0_execute_command(void) {
+     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
++    if (gt_active() && !gt_unqueued(opcode)) {
++        GpuTimingDrawState st;
++        gt_draw_state(&st);
++        const uint32_t ticks = gpu_timing_command_ticks(&st, gp0_cmd_buf,
++                                                        (uint32_t)gp0_words_needed);
++        const uint64_t at = gpu_timing_clock(psx_cycle_count);
++        gpu_timing_command(at, ticks);
++        if (difftrace_gpulog_on) difftrace_gpu(opcode, ticks, at);  /* T2DIFF_GPULOG */
++    }
+     gp0_opcode_count[opcode]++;
+     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
+     extern void ws_bg_phase_note(uint32_t op);
+@@ -8025,6 +8085,13 @@ static void gpu_write_gp0_body(uint32_t val) {
+         if (polyline_has_prev &&
+             !psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y)) {
+             gr_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
++            if (gt_active()) {
++                GpuTimingDrawState st;
++                gt_draw_state(&st);
++                s_gt_line_ticks = gpu_timing_line_ticks(&st, polyline_prev_x,
++                                                        polyline_prev_y, x, y);
++                s_gt_line_pending = 1;
++            }
+         }
+         polyline_prev_x = x; polyline_prev_y = y;
+         if (polyline_has_prev < 2) polyline_has_prev++;
+@@ -8070,6 +8137,14 @@ static void gpu_write_gp0_body(uint32_t val) {
+             if (!psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y))
+                 gr_draw_shaded_line(polyline_prev_x, polyline_prev_y,
+                                     polyline_prev_c, x, y, polyline_color);
++            if (gt_active() &&
++                !psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y)) {
++                GpuTimingDrawState st;
++                gt_draw_state(&st);
++                s_gt_line_ticks = gpu_timing_line_ticks(&st, polyline_prev_x,
++                                                        polyline_prev_y, x, y);
++                s_gt_line_pending = 1;
++            }
+             polyline_prev_x = x; polyline_prev_y = y;
+             polyline_prev_c = polyline_color;
+             polyline_has_prev = 3;
+@@ -8142,7 +8217,32 @@ void gpu_write_gp0(uint32_t val) {
+     extern int g_exec_phase;
+     int prev_phase = g_exec_phase;
+     g_exec_phase = 4;
++    /* GPU draw time: the word enters the FIFO now. Fixed-length commands are
++     * charged when complete (gp0_execute_command), CPU-to-VRAM data words
++     * and polyline segments here. */
++    const int gt = gt_active();
++    const Gp0State gt_prev = gp0_state;
++    uint64_t gt_now = 0;
++    if (gt) {
++        gt_now = gpu_timing_clock(psx_cycle_count);
++        if (!(gt_prev == GP0_IDLE && gt_unqueued((uint8_t)(val >> 24))))
++            gpu_timing_word(gt_now);
++    }
+     gpu_write_gp0_body(val);
++    if (gt) {
++        if (gt_prev == GP0_VRAM_WRITE) {
++            gpu_timing_command(gt_now, 0u);
++        } else if (gt_prev == GP0_POLYLINE_MONO ||
++                   gt_prev == GP0_POLYLINE_SHADED) {
++            if (s_gt_line_pending) {
++                gpu_timing_command(gt_now, s_gt_line_ticks);
++                if (difftrace_gpulog_on) difftrace_gpu(0x48u, s_gt_line_ticks, gt_now);
++                s_gt_line_pending = 0;
++            } else if (gp0_state == GP0_IDLE) {
++                gpu_timing_command(gt_now, 0u);   /* terminator */
++            }
++        }
++    }
+     g_exec_phase = prev_phase;
+ }
+ 
+@@ -8158,6 +8258,7 @@ static void gp1_reset(void) {
+ static void gp1_reset_command_buffer(void) {
+     /* GP1(01h): Reset command buffer — clears FIFO, aborts current command */
+     if (gp0_state == GP0_VRAM_WRITE) gr_vram_upload_set_open(0);
++    gpu_timing_clear_fifo(psx_cycle_count);
+     gp0_state = GP0_IDLE;
+     gp0_words_collected = 0;
+     gp0_words_needed = 0;
+diff --git a/runtime/src/gpu_timing.c b/runtime/src/gpu_timing.c
+new file mode 100644
+index 00000000..1cf08d7f
+--- /dev/null
++++ b/runtime/src/gpu_timing.c
+@@ -0,0 +1,368 @@
++/* gpu_timing.c: how long the GPU takes to draw (Tekken 2 patch 0006).
++ *
++ * Without this model the GPU finished every command the moment it arrived, so
++ * a game that waits for the GPU (Psy-Q DrawSync polls DMA2 busy and GPUSTAT
++ * bit 26) never waited, and a frame whose drawing overran its VBlank never
++ * dropped. With it, each command keeps the GPU busy for the time it takes on
++ * the reference, the 16-word command FIFO fills and drains, and DMA2 waits
++ * for the FIFO the way the hardware's DMA request does.
++ *
++ * Where the facts come from (docs/PROVENANCE.md):
++ *
++ * - Documented in PSX-SPX:
++ *   graphicsprocessingunitgpu, "GPU I/O Ports, DMA Channels, Commands, VRAM":
++ *   the 16-word command FIFO. graphicsprocessingunitgpu, "GPUSTAT" and its
++ *   "Ready Bits" note: bit 26 ready to receive a command word (clear while
++ *   the GPU wants parameters or is busy), bit 28 write FIFO empty, bit 25 the
++ *   DMA request (FIFO not full for GP1(04h)=1, same as bit 28 for 2).
++ *   graphicsprocessingunitgpu, "GP0(E3h..E5h)": these "do not take up space
++ *   in the FIFO", nor does GP0(00h). dmachannels, "DMA Transfer Rates": DMA2
++ *   moves 1 word per clock, and "GPU polygon rendering time is unknown".
++ *   dmachannels, "CPU Operation during DMA": the CPU runs between linked-list
++ *   entries, and a CPU RAM or I/O read stalls while DMA moves data.
++ *
++ * - Measured, because PSX-SPX gives no draw times: every cost below was
++ *   fitted to the DuckStation reference (ffb33c28) with the probe program in
++ *   recomp/tools/gpu_timing/ (probe.py builds a PS-X EXE that
++ *   times GP0 commands with root counter 2; the 290 results are in
++ *   duckstation-ffb33c28.json; model.py is the same arithmetic in Python and
++ *   checks every result to within 30 ticks). runtime/tests/test_gpu_timing.c
++ *   pins a set of them. The measurements show:
++ *     polygons: a setup time by vertex count, shading and texturing, then one
++ *       tick per pixel of the triangle (area, vertices clamped to the drawing
++ *       area), two if textured, and half again if semi-transparent or mask-
++ *       checked. A quad is two triangles with one setup. Dithering and
++ *       texture depth do not change polygon time.
++ *     rectangles: per row, one tick per pixel; texturing adds one per texel
++ *       for 4bpp and for small 8bpp/15bpp rectangles, and a cache-refill cost
++ *       for larger ones (texture_row_extra); semi-transparency or mask check
++ *       half a tick per pixel.
++ *     lines: the longer axis in ticks. Fill: (width/8 + 9) ticks a row.
++ *       VRAM-to-VRAM copy: two ticks a pixel. CPU-to-VRAM data: no time beyond
++ *       its delivery.
++ *     DMA2 linked list: a node header takes 8.75 cycles; a node's words go
++ *       only when the FIFO is empty (the DMA request of GP1(04h)=2); the FIFO
++ *       empties about 13 ticks after the GPU starts its last command.
++ *   The draw-time formulas were derived from these measurements. DuckStation's
++ *   GPU timing was read for behaviour only; no code, table or constant is
++ *   taken from it.
++ *
++ * Not modelled: interlaced drawing that skips the displayed field, GPU
++ * stalls on VRAM reads (GP0(C0h)), and the timing state in savestates. */
++
++#include "gpu_timing.h"
++#include "execution_profile.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++/* ---- enable ---- */
++
++/* On in a REFERENCE build of a game. Standalone fixtures without an execution
++ * profile keep the old instant GPU unless a test turns the model on. */
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define GPU_TIMING_DEFAULT 1
++#else
++#define GPU_TIMING_DEFAULT 0
++#endif
++
++static int s_enabled = -1;
++
++int gpu_timing_enabled(void) {
++    if (s_enabled < 0) {
++        const char *e = getenv("PSX_GPU_TIMING");
++        if (e && (e[0] == '0' || e[0] == '1'))
++            s_enabled = e[0] == '1';
++        else
++            s_enabled = GPU_TIMING_DEFAULT;
++    }
++    return s_enabled;
++}
++
++void gpu_timing_set_enabled(int on) { s_enabled = on < 0 ? -1 : (on != 0); }
++
++/* ---- draw time (measured; see the file comment) ---- */
++
++static const uint16_t k_poly_setup[2][2][2] = {
++    /* [quad][shaded][textured] */
++    { { 42, 220 }, { 332, 489 } },
++    { { 80, 258 }, { 362, 527 } },
++};
++#define RECT_SETUP      10u
++#define FILL_SETUP      40u
++#define FILL_ROW_EXTRA   9u
++
++static int32_t sext11(uint32_t v) {
++    v &= 0x7FFu;
++    return (v & 0x400u) ? (int32_t)v - 0x800 : (int32_t)v;
++}
++
++static int32_t clampi(int32_t v, int32_t lo, int32_t hi) {
++    return v < lo ? lo : (v > hi ? hi : v);
++}
++
++/* Pixels of one triangle with its vertices clamped to the drawing area
++ * (right and bottom edges exclusive, as measured). */
++static uint32_t tri_pixels(const GpuTimingDrawState *st, const int32_t *x,
++                           const int32_t *y) {
++    int32_t cx[3], cy[3];
++    for (int i = 0; i < 3; i++) {
++        cx[i] = clampi(x[i], st->area_left, st->area_right + 1);
++        cy[i] = clampi(y[i], st->area_top, st->area_bottom + 1);
++    }
++    int64_t cross = (int64_t)(cx[1] - cx[0]) * (cy[2] - cy[0]) -
++                    (int64_t)(cx[2] - cx[0]) * (cy[1] - cy[0]);
++    if (cross < 0) cross = -cross;
++    return (uint32_t)(cross / 2);
++}
++
++static uint32_t fill_ticks(uint32_t px, int textured, int slow) {
++    if (textured) px *= 2u;
++    if (slow) px += (px + 1u) / 2u;
++    return px;
++}
++
++static uint32_t polygon_ticks(const GpuTimingDrawState *st,
++                              const uint32_t *w, uint32_t n) {
++    const uint8_t op = (uint8_t)(w[0] >> 24);
++    const int quad = (op & 0x08u) != 0, shaded = (op & 0x10u) != 0;
++    const int textured = (op & 0x04u) != 0;
++    const int slow = (op & 0x02u) != 0 || st->mask_check;
++    const uint32_t step = 1u + (uint32_t)textured + (uint32_t)shaded;
++    int32_t x[4], y[4];
++    const int verts = quad ? 4 : 3;
++    for (int i = 0; i < verts; i++) {
++        uint32_t idx = 1u + (uint32_t)i * step;
++        uint32_t v = idx < n ? w[idx] : 0u;
++        x[i] = sext11(v) + st->offset_x;
++        y[i] = sext11(v >> 16) + st->offset_y;
++    }
++    uint32_t t = k_poly_setup[quad][shaded][textured];
++    t += fill_ticks(tri_pixels(st, x, y), textured, slow);
++    if (quad) t += fill_ticks(tri_pixels(st, x + 1, y + 1), textured, slow);
++    return t;
++}
++
++/* Extra ticks per rectangle row for fetching texels. 4bpp, and 8bpp/15bpp
++ * rectangles that are at most 128 wide and small (up to 2048 / 1024 pixels):
++ * one tick per texel. Wider than 128: 8 ticks per refill, one refill per 4
++ * texels (8bpp) or per 2 (15bpp). Up to 128 wide but larger: one refill per 4
++ * texels, of 4 ticks (8bpp) or 8 (15bpp), times the number of whole widths
++ * that fit in 128. */
++static uint32_t texture_row_extra(uint8_t depth, uint32_t w, uint32_t h) {
++    if (depth == 0u || w == 0u) return w;
++    const int eight = depth == 1u;
++    if (w > 128u) return (w / (eight ? 4u : 2u)) * 8u;
++    if (w * h <= (eight ? 2048u : 1024u)) return w;
++    return (w / 4u) * (eight ? 4u : 8u) * (128u / w);
++}
++
++static uint32_t rect_ticks(const GpuTimingDrawState *st, int32_t x, int32_t y,
++                           uint32_t w, uint32_t h, int textured, int semi) {
++    int32_t x0 = x > st->area_left ? x : st->area_left;
++    int32_t y0 = y > st->area_top ? y : st->area_top;
++    int32_t x1 = x + (int32_t)w, y1 = y + (int32_t)h;
++    if (x1 > st->area_right + 1) x1 = st->area_right + 1;
++    if (y1 > st->area_bottom + 1) y1 = st->area_bottom + 1;
++    if (x1 <= x0 || y1 <= y0) return RECT_SETUP;
++    const uint32_t cw = (uint32_t)(x1 - x0), ch = (uint32_t)(y1 - y0);
++    uint32_t row = cw;
++    if (textured) row += texture_row_extra(st->tex_depth, cw, ch);
++    if (semi || st->mask_check) row += (cw + 1u) / 2u;
++    return RECT_SETUP + row * ch;
++}
++
++uint32_t gpu_timing_line_ticks(const GpuTimingDrawState *st, int32_t ax,
++                               int32_t ay, int32_t bx, int32_t by) {
++    int32_t x0 = ax < bx ? ax : bx, x1 = ax < bx ? bx : ax;
++    int32_t y0 = ay < by ? ay : by, y1 = ay < by ? by : ay;
++    if (x0 < st->area_left) x0 = st->area_left;
++    if (y0 < st->area_top) y0 = st->area_top;
++    if (x1 > st->area_right) x1 = st->area_right;
++    if (y1 > st->area_bottom) y1 = st->area_bottom;
++    if (x1 < x0 || y1 < y0) return 0u;
++    int32_t dx = x1 - x0, dy = y1 - y0;
++    return (uint32_t)(dx > dy ? dx : dy);
++}
++
++uint32_t gpu_timing_command_ticks(const GpuTimingDrawState *st,
++                                  const uint32_t *w, uint32_t n) {
++    if (n == 0u) return 0u;
++    const uint8_t op = (uint8_t)(w[0] >> 24);
++    if (op >= 0x20u && op <= 0x3Fu) return polygon_ticks(st, w, n);
++    if (op >= 0x60u && op <= 0x7Fu) {
++        const int textured = (op & 0x04u) != 0, semi = (op & 0x02u) != 0;
++        uint32_t xy = n > 1u ? w[1] : 0u;
++        int32_t x = sext11(xy) + st->offset_x, y = sext11(xy >> 16) + st->offset_y;
++        uint32_t rw, rh;
++        switch ((op >> 3) & 3u) {
++        case 0: {
++            uint32_t idx = textured ? 3u : 2u;
++            uint32_t wh = idx < n ? w[idx] : 0u;
++            rw = wh & 0x3FFu;
++            rh = (wh >> 16) & 0x1FFu;
++            break;
++        }
++        case 1: rw = rh = 1u; break;
++        case 2: rw = rh = 8u; break;
++        default: rw = rh = 16u; break;
++        }
++        return rect_ticks(st, x, y, rw, rh, textured, semi);
++    }
++    if (op >= 0x40u && op <= 0x5Fu) {
++        const int shaded = (op & 0x10u) != 0;
++        uint32_t a = n > 1u ? w[1] : 0u;
++        uint32_t bi = shaded ? 3u : 2u;
++        uint32_t b = bi < n ? w[bi] : a;
++        return gpu_timing_line_ticks(st,
++            sext11(a) + st->offset_x, sext11(a >> 16) + st->offset_y,
++            sext11(b) + st->offset_x, sext11(b >> 16) + st->offset_y);
++    }
++    if (op == 0x02u && n >= 3u) {
++        uint32_t fw = ((w[2] & 0x3FFu) + 0xFu) & ~0xFu;
++        uint32_t fh = (w[2] >> 16) & 0x1FFu;
++        return FILL_SETUP + (fw / 8u + FILL_ROW_EXTRA) * fh;
++    }
++    if (op >= 0x80u && op <= 0x9Fu && n >= 4u) {
++        uint32_t cw = ((w[3] - 1u) & 0x3FFu) + 1u;
++        uint32_t chh = (((w[3] >> 16) - 1u) & 0x1FFu) + 1u;
++        return 2u * cw * chh;
++    }
++    return 0u;
++}
++
++/* ---- FIFO and busy state ----
++ *
++ * Times are absolute GPU ticks (guest cycle * 2). A command's words sit in the
++ * FIFO from arrival until RELEASE_TICKS after the GPU starts it (measured: a
++ * DMA2 node of NOP words takes 6.5 cycles more than its words to clear the
++ * DMA request). The GPU starts a command when it has finished the previous
++ * one and draws it for its draw time. */
++
++#define RELEASE_TICKS 13u
++#define QUEUE_CAP 32u
++
++typedef struct { uint64_t release; uint32_t words; } QEntry;
++
++static QEntry   s_q[QUEUE_CAP];
++static uint32_t s_q_head, s_q_count;
++static uint32_t s_partial;          /* words of the command being received */
++static uint64_t s_busy_until;       /* ticks */
++static GpuTimingStats s_stats;
++
++void gpu_timing_reset(void) {
++    s_q_head = s_q_count = 0;
++    s_partial = 0;
++    s_busy_until = 0;
++}
++
++static void purge(uint64_t t) {
++    while (s_q_count && s_q[s_q_head].release <= t) {
++        s_q_head = (s_q_head + 1u) % QUEUE_CAP;
++        s_q_count--;
++    }
++}
++
++static uint32_t occupancy(uint64_t t) {
++    purge(t);
++    uint32_t n = s_partial;
++    for (uint32_t i = 0; i < s_q_count; i++)
++        n += s_q[(s_q_head + i) % QUEUE_CAP].words;
++    return n;
++}
++
++void gpu_timing_clear_fifo(uint64_t now) {
++    (void)now;
++    s_q_head = s_q_count = 0;
++    s_partial = 0;
++}
++
++void gpu_timing_word(uint64_t now) {
++    (void)now;
++    s_partial++;
++}
++
++static uint64_t s_clock;
++static int s_clock_set;
++
++void gpu_timing_set_clock(uint64_t now) { s_clock = now; s_clock_set = 1; }
++void gpu_timing_clear_clock(void) { s_clock_set = 0; }
++uint64_t gpu_timing_clock(uint64_t fallback) {
++    return s_clock_set ? s_clock : fallback;
++}
++
++void gpu_timing_command(uint64_t now, uint32_t ticks) {
++    const uint64_t t = now * GPU_TIMING_TICKS_PER_CYCLE;
++    purge(t);
++    const uint64_t start = s_busy_until > t ? s_busy_until : t;
++    const uint64_t release = start + RELEASE_TICKS;
++    s_busy_until = start + ticks;
++    if (s_partial) {
++        QEntry *last = s_q_count
++            ? &s_q[(s_q_head + s_q_count - 1u) % QUEUE_CAP] : NULL;
++        if (last && (last->release == release || s_q_count == QUEUE_CAP)) {
++            last->words += s_partial;
++            if (release > last->release) last->release = release;
++        } else {
++            QEntry *e = &s_q[(s_q_head + s_q_count) % QUEUE_CAP];
++            e->release = release;
++            e->words = s_partial;
++            s_q_count++;
++        }
++        s_partial = 0;
++    }
++    s_stats.commands++;
++    s_stats.busy_ticks += ticks;
++}
++
++int gpu_timing_fifo_empty(uint64_t now) {
++    return occupancy(now * GPU_TIMING_TICKS_PER_CYCLE) == 0u;
++}
++
++int gpu_timing_fifo_full(uint64_t now) {
++    return occupancy(now * GPU_TIMING_TICKS_PER_CYCLE) >= GPU_TIMING_FIFO_WORDS;
++}
++
++int gpu_timing_idle(uint64_t now) {
++    const uint64_t t = now * GPU_TIMING_TICKS_PER_CYCLE;
++    int idle = occupancy(t) == 0u && s_busy_until <= t;
++    if (!idle) s_stats.idle_reads++;
++    return idle;
++}
++
++static uint32_t ticks_to_cycles(uint64_t ticks) {
++    uint64_t c = (ticks + GPU_TIMING_TICKS_PER_CYCLE - 1u) / GPU_TIMING_TICKS_PER_CYCLE;
++    return c > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)c;
++}
++
++uint32_t gpu_timing_cycles_to_fifo_empty(uint64_t now) {
++    const uint64_t t = now * GPU_TIMING_TICKS_PER_CYCLE;
++    purge(t);
++    /* A command split across DMA nodes cannot complete while the DMA waits;
++     * do not wait on its own words. */
++    if (s_partial || !s_q_count) return 0u;
++    const uint64_t last = s_q[(s_q_head + s_q_count - 1u) % QUEUE_CAP].release;
++    return last > t ? ticks_to_cycles(last - t) : 0u;
++}
++
++uint32_t gpu_timing_cycles_to_fifo_room(uint64_t now) {
++    const uint64_t t = now * GPU_TIMING_TICKS_PER_CYCLE;
++    if (occupancy(t) < GPU_TIMING_FIFO_WORDS || !s_q_count) return 0u;
++    const uint64_t first = s_q[s_q_head].release;
++    return first > t ? ticks_to_cycles(first - t) : 0u;
++}
++
++uint32_t gpu_timing_cycles_to_idle(uint64_t now) {
++    const uint64_t t = now * GPU_TIMING_TICKS_PER_CYCLE;
++    uint64_t end = s_busy_until;
++    purge(t);
++    if (s_q_count) {
++        uint64_t r = s_q[(s_q_head + s_q_count - 1u) % QUEUE_CAP].release;
++        if (r > end) end = r;
++    }
++    return end > t ? ticks_to_cycles(end - t) : 0u;
++}
++
++void gpu_timing_get_stats(GpuTimingStats *out) {
++    if (out) *out = s_stats;
++}
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index 86528dbe..20fa2ddd 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -253,6 +253,7 @@ static void advance_devices(uint32_t c) {
+ static uint64_t s_devices_synced_cycle = 0;  /* devices are advanced up to here */
+ /* Exported for the inlined psx_advance_cycles / psx_cyc_charge hot path. */
+ uint64_t psx_next_service_cycle = 0;         /* absolute; 0 = dirty, recompute  */
++uint32_t (*psx_device_cpu_stall_hook)(void) = 0; /* Tekken 2 patch 0006 */
+ int      psx_in_device_service  = 0;         /* re-entrancy guard               */
+ int      g_plp_cycle_diag       = 0;
+ uint64_t g_plp_adv_calls        = 0;
+@@ -390,6 +391,16 @@ void psx_devices_service_to_now(void) {
+     }
+     psx_cycle_sample_check(target);
+     psx_devices_recompute_deadline();
++    /* Timed GPU DMA (Tekken 2 patch 0006): a DMA burst halted the CPU. The
++     * guest clock moves on by that much; the next service replays the gap
++     * for the devices. */
++    if (psx_device_cpu_stall_hook) {
++        const uint32_t stall = psx_device_cpu_stall_hook();
++        if (stall) {
++            psx_cycle_count += stall;
++            psx_next_service_cycle = 0;
++        }
++    }
+     psx_in_device_service = 0;
+ 
+     /* Sparse host maintenance (was on every psx_advance_cycles). HARD_CAP
+diff --git a/runtime/tests/test_dma_gpu_list_cpu_hold.py b/runtime/tests/test_dma_gpu_list_cpu_hold.py
+index 24a9ff19..5ebd60f0 100644
+--- a/runtime/tests/test_dma_gpu_list_cpu_hold.py
++++ b/runtime/tests/test_dma_gpu_list_cpu_hold.py
+@@ -17,6 +17,6 @@ if __name__ == '__main__':
+     with tempfile.TemporaryDirectory() as root:
+         for opt in ('-O0', '-O2'):
+             build_and_run(args.cc, here, here.parent, opt, Path(root),
+-                          ['dma.c', 'dma_gpu_ll.c', 'gpu_timeline.c'],
++                          ['dma.c', 'dma_gpu_ll.c', 'gpu_timeline.c', 'gpu_timing.c'],
+                           'test_dma_gpu_list_cpu_hold.c')
+     print('PASS: the GPU linked-list kick holds the CPU until the walk ends (O0/O2)')
+diff --git a/runtime/tests/test_gpu_timing.c b/runtime/tests/test_gpu_timing.c
+new file mode 100644
+index 00000000..d5109ab8
+--- /dev/null
++++ b/runtime/tests/test_gpu_timing.c
+@@ -0,0 +1,194 @@
++/* GPU draw-time model (gpu_timing.c, Tekken 2 patch 0006).
++ *
++ * Each cost below is a DuckStation measurement from
++ * recomp/tools/gpu_timing/duckstation-ffb33c28.json (the
++ * probe's "net" CPU cycles times two, in GPU ticks). The model must land
++ * within the probe's poll jitter (TOL ticks). The queue tests pin the FIFO
++ * and DMA-request rules the DMA2 measurements showed. */
++#include "gpu_timing.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define TOL 30
++static int g_fail;
++
++static GpuTimingDrawState full_area(void) {
++    GpuTimingDrawState st = {0, 0, 1023, 511, 0, 0, 0, 0};
++    return st;
++}
++
++static uint32_t xy(int x, int y) {
++    return ((uint32_t)(y & 0xFFFF) << 16) | (uint32_t)(x & 0xFFFF);
++}
++
++static void expect_near(const char *name, uint32_t got, uint32_t measured) {
++    long d = (long)got - (long)measured;
++    if (d < -TOL || d > TOL) {
++        printf("FAIL %-32s model %u, measured %u\n", name, got, measured);
++        g_fail = 1;
++    } else {
++        printf("ok   %-32s model %u, measured %u\n", name, got, measured);
++    }
++}
++
++static void expect_eq(const char *name, long got, long want) {
++    if (got != want) {
++        printf("FAIL %-32s got %ld, want %ld\n", name, got, want);
++        g_fail = 1;
++    } else {
++        printf("ok   %-32s %ld\n", name, got);
++    }
++}
++
++static uint32_t cost(const GpuTimingDrawState *st, const uint32_t *w, uint32_t n) {
++    return gpu_timing_command_ticks(st, w, n);
++}
++
++static void test_costs(void) {
++    GpuTimingDrawState st = full_area();
++    /* Polygons: right triangles with legs s. */
++    uint32_t mono64[] = {0x20808080, xy(0, 0), xy(64, 0), xy(0, 64)};
++    expect_near("tri mono 64", cost(&st, mono64, 4), 2086);
++    uint32_t mono256[] = {0x20808080, xy(0, 0), xy(256, 0), xy(0, 256)};
++    expect_near("tri mono 256", cost(&st, mono256, 4), 32816);
++    uint32_t semi128[] = {0x22808080, xy(0, 0), xy(128, 0), xy(0, 128)};
++    expect_near("tri mono semi 128", cost(&st, semi128, 4), 12334);
++    uint32_t shaded64[] = {0x30808080, xy(0, 0), 0x406080, xy(64, 0),
++                           0x406080, xy(0, 64)};
++    expect_near("tri shaded 64", cost(&st, shaded64, 6), 2380);
++    uint32_t tex64[] = {0x24808080, xy(0, 0), 0x7F000000, xy(64, 0),
++                        0x00084000, xy(0, 64), 0x00004000};
++    expect_near("tri tex 64", cost(&st, tex64, 7), 4312);
++    uint32_t shtex128[] = {0x34808080, xy(0, 0), 0x7F000000, 0x406080,
++                           xy(128, 0), 0x00080080, 0x406080, xy(0, 128),
++                           0x00008000};
++    expect_near("tri shaded tex 128", cost(&st, shtex128, 9), 16870);
++    uint32_t quad32[] = {0x2C808080, xy(0, 0), 0x7F000000, xy(32, 0),
++                         0x00080020, xy(0, 32), 0x00002000, xy(32, 32),
++                         0x00002020};
++    expect_near("quad tex 32", cost(&st, quad32, 9), 2310);
++    uint32_t degenerate[] = {0x20808080, xy(0, 0), xy(64, 0), xy(128, 0)};
++    expect_near("tri degenerate", cost(&st, degenerate, 4), 42);
++
++    /* Clipping: vertices clamp to the drawing area. */
++    GpuTimingDrawState small = st;
++    small.area_right = 63;
++    small.area_bottom = 63;
++    expect_near("tri 256 clipped to 64x64", cost(&small, mono256, 4), 2086);
++    uint32_t outside[] = {0x20808080, xy(100, 100), xy(164, 100), xy(100, 164)};
++    expect_near("tri outside the area", cost(&small, outside, 4), 42);
++
++    /* The draw offset moves vertices before clipping. */
++    GpuTimingDrawState off = small;
++    off.offset_x = 200;
++    expect_near("tri moved out by offset", cost(&off, mono64, 4), 42);
++
++    /* Rectangles. */
++    uint32_t rect64[] = {0x60808080, xy(0, 0), (64u << 16) | 64u};
++    expect_near("rect mono 64x64", cost(&st, rect64, 3), 4102);
++    uint32_t rect_semi[] = {0x62808080, xy(0, 0), (240u << 16) | 320u};
++    expect_near("rect mono semi 320x240", cost(&st, rect_semi, 3), 115208);
++    uint32_t trect[] = {0x64808080, xy(0, 0), 0x7F000000, (64u << 16) | 64u};
++    expect_near("rect tex4 64x64", cost(&st, trect, 4), 8204);
++    st.tex_depth = 1;
++    expect_near("rect tex8 64x64", cost(&st, trect, 4), 12306);
++    uint32_t trect132[] = {0x64808080, xy(0, 0), 0x7F000000, (16u << 16) | 132u};
++    expect_near("rect tex8 132x16", cost(&st, trect132, 4), 6342);
++    st.tex_depth = 2;
++    uint32_t trect32[] = {0x64808080, xy(0, 0), 0x7F000000, (64u << 16) | 32u};
++    expect_near("rect tex15 32x64", cost(&st, trect32, 4), 18438);
++    expect_near("rect tex15 64x64", cost(&st, trect, 4), 20496);
++    st.tex_depth = 0;
++    uint32_t sprite16[] = {0x7C808080, xy(0, 0), 0x7F000000};
++    expect_near("sprite16 tex", cost(&st, sprite16, 3), 518);
++    st.mask_check = 1;
++    expect_near("rect mono maskcheck 64x64", cost(&st, rect64, 3), 6160);
++    st.mask_check = 0;
++
++    /* Fill, copy, lines. */
++    uint32_t fill[] = {0x02000000, xy(0, 0), (240u << 16) | 320u};
++    expect_near("fill 320x240", cost(&st, fill, 3), 11802);
++    uint32_t fill_big[] = {0x02000000, xy(0, 0), (480u << 16) | 640u};
++    expect_near("fill 640x480", cost(&st, fill_big, 3), 42758);
++    uint32_t copy[] = {0x80000000, xy(0, 256), xy(512, 0), (64u << 16) | 64u};
++    expect_near("copy 64x64", cost(&st, copy, 4), 8190);
++    uint32_t line[] = {0x40808080, xy(0, 0), xy(256, 256)};
++    expect_near("line mono d256", cost(&st, line, 3), 252);
++
++    /* Environment commands draw nothing. */
++    uint32_t e1[] = {0xE1000408};
++    expect_eq("GP0(E1h) ticks", cost(&st, e1, 1), 0);
++}
++
++static void test_queue(void) {
++    gpu_timing_set_enabled(1);
++    gpu_timing_reset();
++    /* A 4-word triangle written at cycle 1000 that draws for 2086 ticks. */
++    for (int i = 0; i < 4; i++) gpu_timing_word(1000);
++    expect_eq("mid-command not idle", gpu_timing_idle(1000), 0);
++    gpu_timing_command(1000, 2086);
++    expect_eq("busy right after", gpu_timing_idle(1001), 0);
++    expect_eq("FIFO empty once started", gpu_timing_fifo_empty(1007), 1);
++    expect_eq("cycles to idle", gpu_timing_cycles_to_idle(1000), 1043);
++    expect_eq("idle after draw time", gpu_timing_idle(1000 + 1043), 1);
++
++    /* Two more triangles queue behind the first: the second waits in the
++     * FIFO until the first ends, so the DMA request (FIFO empty) returns
++     * only then (plus the 13-tick release). */
++    gpu_timing_reset();
++    for (int t = 0; t < 2; t++) {
++        for (int i = 0; i < 4; i++) gpu_timing_word(2000);
++        gpu_timing_command(2000, 2086);
++    }
++    expect_eq("second command waits", gpu_timing_fifo_empty(2010), 0);
++    expect_eq("DMA request after first", gpu_timing_cycles_to_fifo_empty(2000),
++              1043 + 7);
++    expect_eq("idle after both", gpu_timing_cycles_to_idle(2000), 2086);
++
++    /* Sixteen words fill the FIFO; a 17th waits for the first queued
++     * command to start. */
++    gpu_timing_reset();
++    for (int i = 0; i < 4; i++) gpu_timing_word(3000);
++    gpu_timing_command(3000, 20000);                 /* drawing */
++    for (int c = 0; c < 4; c++) {
++        for (int i = 0; i < 4; i++) gpu_timing_word(3001);
++        gpu_timing_command(3001, 100);
++    }
++    expect_eq("FIFO full at 16 words", gpu_timing_fifo_full(3002), 1);
++    /* At cycle 3010 the drawing command has left the FIFO; the four queued
++     * ones (16 words) wait for it to end at tick 26000 (+13 release). */
++    expect_eq("room after the first draw", gpu_timing_cycles_to_fifo_room(3010),
++              (26013 - 6020 + 1) / 2);
++
++    /* GP1(01h) empties the FIFO; GP1(00h) resets everything. */
++    gpu_timing_clear_fifo(3002);
++    expect_eq("FIFO cleared", gpu_timing_fifo_empty(3002), 1);
++    gpu_timing_reset();
++    expect_eq("reset is idle", gpu_timing_idle(0), 1);
++}
++
++static void test_gate(void) {
++    gpu_timing_set_enabled(1);
++    expect_eq("forced on", gpu_timing_enabled(), 1);
++    gpu_timing_set_enabled(0);
++    expect_eq("forced off", gpu_timing_enabled(), 0);
++    gpu_timing_set_enabled(-1);
++    /* A fixture without an execution profile defaults to off unless the
++     * environment says otherwise. */
++    const char *e = getenv("PSX_GPU_TIMING");
++    expect_eq("standalone default", gpu_timing_enabled(),
++              e && e[0] == '1' ? 1 : 0);
++}
++
++int main(void) {
++    test_costs();
++    test_queue();
++    test_gate();
++    if (g_fail) {
++        printf("gpu_timing_test: FAILED\n");
++        return 1;
++    }
++    printf("gpu_timing_test: all passed\n");
++    return 0;
++}

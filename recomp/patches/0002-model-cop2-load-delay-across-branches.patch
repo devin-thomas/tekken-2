@@ -1,0 +1,581 @@
+Subject: [PATCH] Model the MIPS-I load delay of MFC2/CFC2 and delay-slot loads
+
+On the R3000A a load (LB/LH/LW/LBU/LHU) and a COP2 move (MFC2/CFC2) write
+their GPR one instruction late. The CFG emitter modeled that only for
+in-block pairs of ordinary loads: MFC2/CFC2 were written immediately, and
+a load in a branch delay slot was written before the branch's successor
+ran.
+
+Tekken 2 (USA Rev 1) depends on both at once. Its fighter vertex loop
+(0x80072890) is software-pipelined: `bgtz t9, 0x800728CC` carries
+`mfc2 t0, SZ1` in its delay slot, and the target's first instruction is
+`mtc2 t0, VXY0`, which on hardware still reads the vertex word loaded
+into t0 by `lw t0, 0(t8)`. Writing t0 early handed VXY0 the depth value
+(Y = 0), so every RTPT batch after the first projected a long spike: the
+"exploding fighters" in every in-fight frame. The dirty-RAM interpreter
+keeps eager writes in game RAM, so PSX_FORCE_INTERP=1 showed the same.
+
+- MFC2/CFC2 join the in-block load-delay pairs (delayed_gpr_dest).
+- scan_delay_slot_loads() finds a delayed write in a Branch/J delay slot
+  whose in-function successor reads the register first. The slot writes
+  psx_dsl_<slot>; the arm into that successor sets psx_dslp_<slot>, and
+  the successor block retires the write after its first instruction (or
+  drops it when that instruction writes the register). Other arms write
+  back before the transfer. The successor skips the (parked) precise
+  slice while a write is pending, so the C local never leaves the
+  function. Unmodelable shapes (successor outside the function, a branch,
+  or a load of the same register) are logged and keep the old writeback.
+- Tekken 2: one site (0x80072948 -> 0x800728CC); no in-block MFC2/CFC2
+  pairs; the generated diff is that function only.
+- test_cop2_delay_slot_load.py (ctest cop2_delay_slot_load): the Tekken
+  loop shape plus an in-block `mfc2; addu`; fails 8 checks without this
+  change. The OpenBIOS emitter fingerprint does not cover
+  code_generator.cpp, so its stamp is unchanged.
+
+---
+diff --git a/recompiler/CMakeLists.txt b/recompiler/CMakeLists.txt
+index 53139d23..e2bc2ed2 100644
+--- a/recompiler/CMakeLists.txt
++++ b/recompiler/CMakeLists.txt
+@@ -1226,6 +1226,12 @@ if(BUILD_TESTING)
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lwlr_load_delay_forward.py
+                     --recompiler $<TARGET_FILE:psxrecomp-game>
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
++        add_test(
++            NAME cop2_delay_slot_load
++            COMMAND ${Python3_EXECUTABLE}
++                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cop2_delay_slot_load.py
++                    --recompiler $<TARGET_FILE:psxrecomp-game>
++            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+         add_test(
+             NAME dirty_text_continuation_guards
+             COMMAND ${Python3_EXECUTABLE}
+diff --git a/recompiler/include/code_generator.h b/recompiler/include/code_generator.h
+index 36fa8642..8179e30d 100644
+--- a/recompiler/include/code_generator.h
++++ b/recompiler/include/code_generator.h
+@@ -525,6 +525,23 @@ private:
+         const ControlFlowGraph& cfg,
+         std::map<uint32_t, std::vector<uint32_t>>& out_edges);
+ 
++    // MIPS-I load delay across a branch: a GPR load (LB/LH/LW/LBU/LHU) or a
++    // COP2 move (MFC2/CFC2) in a conditional branch's or j's delay slot is
++    // still invisible to the first instruction at the branch's successor.
++    // scan_delay_slot_loads() finds the slots whose in-function successor
++    // reads the destination; translate_basic_block() then defers the
++    // writeback through the function-scope psx_dsl_<slot> temp and
++    // psx_dslp_<slot> flag, retiring it after the successor's first
++    // instruction. dsl_decls() is the declaration block for those temps.
++    struct DelaySlotLoad {
++        uint32_t rt = 0;
++        std::set<uint32_t> dependent;   // successor block leaders that read rt first
++    };
++    std::map<uint32_t, DelaySlotLoad> dsl_sites_;              // delay-slot addr -> site
++    std::map<uint32_t, std::vector<uint32_t>> dsl_flush_at_;  // successor -> delay-slot addrs
++    void scan_delay_slot_loads(const ControlFlowGraph& cfg);
++    std::string dsl_decls() const;
++
+     // Control flow translation
+     // Main-EXE opcode guard for bltz_sites, bgez_sites and branch_keep_sites
+     // (exits 1 on a mismatch; overlay mode keeps vanilla code).
+diff --git a/recompiler/src/code_generator.cpp b/recompiler/src/code_generator.cpp
+index f7413b98..a80fdb75 100644
+--- a/recompiler/src/code_generator.cpp
++++ b/recompiler/src/code_generator.cpp
+@@ -31,6 +31,95 @@ static bool block_needs_fallthrough(const BasicBlock& block) {
+             block.successors.empty() && block.exit_instr.target == 0);
+ }
+ 
++/* GPR written one instruction late on the R3000A (MIPS-I load delay): the
++ * simple loads LB/LH/LW/LBU/LHU and the COP2 moves MFC2/CFC2 (PSX-SPX "COP2
++ * ... MFC2/CFC2 ... have a delay like LW"; Beetle and DuckStation write both
++ * through their delayed-load slot). LWL/LWR are excluded: they forward into
++ * a following LWL/LWR and are handled by the LWL/LWR forwarding path.
++ * Returns the destination GPR, or -1. */
++static int delayed_gpr_dest(uint32_t w) {
++    const uint32_t op = w >> 26, rt = (w >> 16) & 31u;
++    if (op == 0x20u || op == 0x21u || op == 0x23u || op == 0x24u || op == 0x25u)
++        return rt ? static_cast<int>(rt) : -1;
++    if (op == 0x12u) {
++        const uint32_t f = (w >> 21) & 31u;
++        if (f == 0x00u || f == 0x02u) return rt ? static_cast<int>(rt) : -1;
++    }
++    return -1;
++}
++
++/* Does instruction w read GPR r? (Same decode as translate_basic_block's
++ * in-block pair test.) */
++static bool insn_reads_gpr_cg(uint32_t w, uint32_t r) {
++    if (r == 0u || w == 0u) return false;
++    uint32_t op = w >> 26, rs = (w >> 21) & 31u;
++    uint32_t rt = (w >> 16) & 31u, fn = w & 63u;
++    if (op == 0u) {
++        if (fn == 0x08u || fn == 0x09u) return rs == r;
++        if (fn == 0x0Cu || fn == 0x0Du || fn == 0x10u || fn == 0x12u)
++            return false;
++        if (fn == 0x00u || fn == 0x02u || fn == 0x03u) return rt == r;
++        return rs == r || rt == r;
++    }
++    if (op == 0x02u || op == 0x03u || op == 0x0Fu) return false;
++    if (op == 0x01u || op == 0x06u || op == 0x07u) return rs == r;
++    if (op == 0x04u || op == 0x05u) return rs == r || rt == r;
++    if (op >= 0x08u && op <= 0x0Eu) return rs == r;
++    if (op == 0x10u) return ((w >> 21) & 31u) == 0x04u && rt == r;
++    if (op == 0x12u) {
++        uint32_t f = (w >> 21) & 31u;
++        return (f == 0x04u || f == 0x06u) && rt == r;
++    }
++    if (op == 0x22u || op == 0x26u || (op >= 0x28u && op <= 0x2Eu))
++        return rs == r || rt == r;
++    return rs == r;
++}
++
++/* Does instruction w write GPR r? */
++static bool insn_writes_gpr_cg(uint32_t w, uint32_t r) {
++    if (r == 0u || w == 0u) return false;
++    uint32_t op = w >> 26, rt = (w >> 16) & 31u;
++    uint32_t rd = (w >> 11) & 31u, fn = w & 63u;
++    if (op == 0u) {
++        if (fn == 0x08u || fn == 0x0Cu || fn == 0x0Du || fn == 0x0Fu ||
++            fn == 0x11u || fn == 0x13u || (fn >= 0x18u && fn <= 0x1Bu)) return false;
++        return rd == r;
++    }
++    if (op == 0x03u) return r == 31u;
++    if (op == 0x01u) return (rt == 0x10u || rt == 0x11u) && r == 31u;
++    if (op == 0x02u || (op >= 0x04u && op <= 0x07u) ||
++        (op >= 0x28u && op <= 0x2Eu) || op == 0x32u || op == 0x3Au)
++        return false;
++    if (op == 0x10u) return ((w >> 21) & 31u) == 0u && rt == r;
++    if (op == 0x12u) {
++        uint32_t f = (w >> 21) & 31u;
++        return (f == 0u || f == 2u) && rt == r;
++    }
++    return rt == r;
++}
++
++/* Point a translated delayed write at `temp` instead of cpu->gpr[rt]: the
++ * assignment itself and the PGXP hook that reports the written value. */
++static bool redirect_delayed_write(std::string& emitted, uint32_t rt,
++                                   const std::string& temp) {
++    const std::string lhs = fmt::format("cpu->gpr[{}] =", rt);
++    bool hit = false;
++    for (size_t at = emitted.find(lhs); at != std::string::npos;
++         at = emitted.find(lhs, at + temp.size())) {
++        emitted.replace(at, lhs.size(), temp + " =");
++        hit = true;
++    }
++    const std::string load_tail = fmt::format(", _pgxa, cpu->gpr[{}]);", rt);
++    for (size_t at = emitted.find(load_tail); at != std::string::npos;
++         at = emitted.find(load_tail, at + 1))
++        emitted.replace(at, load_tail.size(), fmt::format(", _pgxa, {});", temp));
++    const std::string cop2_mid = fmt::format("u, cpu->gpr[{}], 0u);", rt);
++    for (size_t at = emitted.find(cop2_mid); at != std::string::npos;
++         at = emitted.find(cop2_mid, at + 1))
++        emitted.replace(at, cop2_mid.size(), fmt::format("u, {}, 0u);", temp));
++    return hit;
++}
++
+ /* Reserved MIPS-II branch-likely words often appear when discovery sweeps
+  * ASCII/data as code. Emit the RI raise every time (faithfulness), but do not
+  * spam one WARNING per revisit of the same PC — product Generate was flooding
+@@ -2192,10 +2281,21 @@ std::string CodeGenerator::translate_basic_block(
+                 if (co && funct == 0x10u) slice_side_effects = 1;   // RFE
+             }
+         }
++        // A delay-slot load pending into this block (dsl_flush_at_) lives in a
++        // C local: never leave the function before it retires. Slicing is a
++        // parked precision option, so skipping it on that edge only moves an
++        // interrupt to the next block boundary.
++        std::string dsl_pending;
++        auto pend = dsl_flush_at_.find(block.start_addr);
++        if (pend != dsl_flush_at_.end()) {
++            for (uint32_t ds : pend->second)
++                dsl_pending += fmt::format("!psx_dslp_{:08X} && ", ds);
++        }
+         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+         ss << config_.indent
+-           << fmt::format("if (psx_slice_block(cpu, 0x{:08X}u, {}u, {})) return;\n",
+-                          runtime_pc(block.start_addr), slice_bcyc, slice_side_effects);
++           << fmt::format("if ({}psx_slice_block(cpu, 0x{:08X}u, {}u, {})) return;\n",
++                          dsl_pending, runtime_pc(block.start_addr), slice_bcyc,
++                          slice_side_effects);
+         ss << "#endif\n";
+     }
+ 
+@@ -2279,15 +2379,8 @@ std::string CodeGenerator::translate_basic_block(
+      * resident/full-function emitter already models these; overlay/game CFG
+      * emission must do the same.  OpenBIOS's CD/card fasttrack deliberately
+      * uses `lw k0,...; move at,k0`, where the move must observe OLD k0. */
+-    auto simple_load_dest = [](uint32_t w) -> int {
+-        uint32_t op = w >> 26;
+-        if (op == 0x20u || op == 0x21u || op == 0x23u ||
+-            op == 0x24u || op == 0x25u) {
+-            uint32_t rt = (w >> 16) & 31u;
+-            return rt ? static_cast<int>(rt) : -1;
+-        }
+-        return -1;
+-    };
++    /* MFC2/CFC2 have the same one-instruction delay as LW (delayed_gpr_dest). */
++    auto simple_load_dest = [](uint32_t w) -> int { return delayed_gpr_dest(w); };
+     auto reads_gpr = [](uint32_t w, uint32_t r) -> bool {
+         if (r == 0u || w == 0u) return false;
+         uint32_t op = w >> 26, rs = (w >> 21) & 31u;
+@@ -2418,6 +2511,13 @@ std::string CodeGenerator::translate_basic_block(
+                     if (hook != std::string::npos)
+                         emitted.replace(hook, pgxp_tail.size(),
+                                         fmt::format(", _pgxa, {});", temp));
++                    // MFC2/CFC2: PGXP_COP2(insn, value, 0u) reports the value.
++                    const std::string cop2_mid =
++                        fmt::format("u, cpu->gpr[{}], 0u);", load_dest);
++                    const size_t cop2_hook = emitted.rfind(cop2_mid);
++                    if (cop2_hook != std::string::npos)
++                        emitted.replace(cop2_hook, cop2_mid.size(),
++                                        fmt::format("u, {}, 0u);", temp));
+                     if (per_selector) {
+                         // The remaining selector copies, same two rewrites.
+                         for (size_t at = emitted.find(lhs); at != std::string::npos;
+@@ -2437,6 +2537,25 @@ std::string CodeGenerator::translate_basic_block(
+                 }
+             }
+             ss << emitted << "\n";
++            // Retire a load from a predecessor's branch delay slot: this first
++            // instruction ran in its shadow and saw the old register.
++            if (addr == block.start_addr) {
++                auto pend = dsl_flush_at_.find(addr);
++                if (pend != dsl_flush_at_.end()) {
++                    for (uint32_t ds : pend->second) {
++                        const uint32_t rt = dsl_sites_.at(ds).rt;
++                        if (insn_writes_gpr_cg(instr, rt)) {
++                            ss << config_.indent << fmt::format(
++                                "psx_dslp_{:08X} = 0;  /* delay-slot load: this write wins */\n", ds);
++                        } else {
++                            ss << config_.indent << fmt::format(
++                                "if (psx_dslp_{0:08X}) {{ cpu->gpr[{1}] = psx_dsl_{0:08X}; "
++                                "psx_dslp_{0:08X} = 0; }}  /* delay-slot load writeback */\n",
++                                ds, rt);
++                        }
++                    }
++                }
++            }
+             if (delayed_load_active && addr == delayed_load_addr + 4u) {
+                 if (forward_to_lwlr) {
+                     ss << config_.indent << fmt::format(
+@@ -2462,6 +2581,20 @@ std::string CodeGenerator::translate_basic_block(
+                 // generate_branch_condition; check them here.
+                 check_explicit_branch_site(addr, block.exit_instr.instruction);
+                 ss << config_.indent << mod_instruction_call(addr, instr);
++                uint32_t dsl_slot = 0;            // delay slot holding a deferred load
++                // Before an arm's transfer: hand a deferred delay-slot load to a
++                // successor that reads it first, else write it back now.
++                auto dsl_arm = [&](uint32_t succ, bool in_function) -> std::string {
++                    if (!dsl_slot) return "";
++                    const auto& site = dsl_sites_.at(dsl_slot);
++                    if (in_function && site.dependent.count(succ))
++                        return config_.indent + config_.indent +
++                               fmt::format("psx_dslp_{:08X} = 1;  /* retired at block_{:08X} */\n",
++                                           dsl_slot, succ);
++                    return config_.indent + config_.indent +
++                           fmt::format("cpu->gpr[{}] = psx_dsl_{:08X};  /* load-delay writeback */\n",
++                                       site.rt, dsl_slot);
++                };
+                 std::string delay_saved_cond;    // branch condition captured before delay
+                 std::string delay_saved_target;  // JR/JALR target captured before delay
+ 
+@@ -2593,7 +2726,19 @@ std::string CodeGenerator::translate_basic_block(
+                             // Delay slot's own fetch + §1+deps+DO_LDS, before its body (skipped if a load).
+                             if (cycle_per_insn) emit_pre_icache(delay_slot_addr, config_.indent);
+                             if (cycle_per_insn) emit_pre_timing(delay_instr, config_.indent);
+-                            ss << translate_instruction(delay_slot_addr, delay_instr) << "\n";
++                            std::string ds_emit = translate_instruction(delay_slot_addr, delay_instr);
++                            auto dsl = dsl_sites_.find(delay_slot_addr);
++                            if (dsl != dsl_sites_.end() &&
++                                (block.exit_instr.type == ControlFlowType::Branch ||
++                                 block.exit_instr.type == ControlFlowType::Jump) &&
++                                redirect_delayed_write(ds_emit, dsl->second.rt,
++                                                       fmt::format("psx_dsl_{:08X}", delay_slot_addr))) {
++                                dsl_slot = delay_slot_addr;
++                                ss << config_.indent << fmt::format(
++                                    "/* MIPS-I load delay: r{} lands after the successor's first instruction */\n",
++                                    dsl->second.rt);
++                            }
++                            ss << ds_emit << "\n";
+                             emit_cosim_instr(delay_slot_addr, config_.indent);
+                         }
+                     }
+@@ -2607,10 +2752,12 @@ std::string CodeGenerator::translate_basic_block(
+                         : delay_saved_cond;
+                     if (block.successors.size() == 2) {
+                         ss << config_.indent << "if (" << condition << ") {\n";
++                        ss << dsl_arm(block.successors[0], true);
+                         ss << emit_interrupt_check(block.successors[0], config_.indent + config_.indent);
+                         ss << config_.indent << config_.indent
+                            << fmt::format("goto block_{:08X};  /* taken */\n", block.successors[0]);
+                         ss << config_.indent << "} else {\n";
++                        ss << dsl_arm(block.successors[1], true);
+                         ss << emit_interrupt_check(block.successors[1], config_.indent + config_.indent);
+                         ss << config_.indent << config_.indent
+                            << fmt::format("goto block_{:08X};  /* not taken */\n", block.successors[1]);
+@@ -2625,6 +2772,7 @@ std::string CodeGenerator::translate_basic_block(
+                         bool fallthru_in = cfg.blocks.count(fall_through_addr) > 0;
+ 
+                         ss << config_.indent << "if (" << condition << ") {\n";
++                        ss << dsl_arm(branch_target, target_in);
+                         if (target_in) {
+                             ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
+                             ss << config_.indent << config_.indent
+@@ -2644,6 +2792,7 @@ std::string CodeGenerator::translate_basic_block(
+                                << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* taken: split (mid-func) */\n", runtime_pc(branch_target));
+                         }
+                         ss << config_.indent << "} else {\n";
++                        ss << dsl_arm(fall_through_addr, fallthru_in);
+                         if (fallthru_in) {
+                             ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
+                             ss << config_.indent << config_.indent
+@@ -2666,6 +2815,12 @@ std::string CodeGenerator::translate_basic_block(
+                     }
+                 } else if (block.exit_instr.type == ControlFlowType::Jump) {
+                     // Unconditional jump
++                    {
++                        const uint32_t succ = block.successors.empty()
++                            ? block.exit_instr.target : block.successors[0];
++                        const std::string arm = dsl_arm(succ, !block.successors.empty());
++                        if (!arm.empty()) ss << arm.substr(config_.indent.size());
++                    }
+                     if (!block.successors.empty()) {
+                         ss << emit_interrupt_check(block.successors[0], config_.indent);
+                         ss << config_.indent
+@@ -3117,6 +3272,7 @@ GeneratedFunction CodeGenerator::generate_function(
+     extra_labels_.clear();
+     std::map<uint32_t, std::vector<uint32_t>> jr_table_edges;
+     scan_jr_tables(cfg, jr_table_edges);
++    scan_delay_slot_loads(cfg);
+ 
+     // CPS (§25): collect this function's continuations (call return points) as
+     // blocks are translated, so the entry-switch below can route a dispatched
+@@ -3169,6 +3325,7 @@ GeneratedFunction CodeGenerator::generate_function(
+                 << config_.indent << "psx_cyc_local_begin(&_psx_lc_acc);\n";
+     }
+     body_ss << "#endif\n";
++    body_ss << dsl_decls();
+ 
+     // CPS entry-switch: when the unified flat trampoline dispatches a
+     // continuation address (a callee published cpu->pc = $ra back to us), route
+@@ -3345,6 +3502,63 @@ GeneratedFunction CodeGenerator::generate_function(
+     return result;
+ }
+ 
++void CodeGenerator::scan_delay_slot_loads(const ControlFlowGraph& cfg) {
++    dsl_sites_.clear();
++    dsl_flush_at_.clear();
++    for (const auto& [baddr, block] : cfg.blocks) {
++        const auto& ex = block.exit_instr;
++        if (!ex.has_delay_slot || ex.is_likely) continue;
++        if (ex.type != ControlFlowType::Branch && ex.type != ControlFlowType::Jump) continue;
++        const uint32_t ds = ex.address + 4u;
++        auto dw = exe_.read_word(ds);
++        if (!dw.has_value()) continue;
++        const int rt = delayed_gpr_dest(*dw);
++        if (rt <= 0) continue;
++        std::vector<uint32_t> succs{ex.target};
++        if (ex.type == ControlFlowType::Branch) succs.push_back(ex.address + 8u);
++        DelaySlotLoad site;
++        site.rt = static_cast<uint32_t>(rt);
++        for (uint32_t succ : succs) {
++            if (succ == 0u || succ == ds) continue;
++            auto sw = exe_.read_word(succ);
++            if (!sw.has_value() || !insn_reads_gpr_cg(*sw, site.rt)) continue;
++            const uint32_t sop = *sw >> 26;
++            const bool modelable = cfg.blocks.count(succ) &&
++                !ControlFlowAnalyzer::is_control_flow(*sw) &&
++                delayed_gpr_dest(*sw) != rt &&
++                !((sop == 0x22u || sop == 0x26u) && ((*sw >> 16) & 31u) == site.rt);
++            if (!modelable) {
++                fmt::print(stderr,
++                    "  [load-delay] UNMODELED: delay-slot load 0x{:08X} r{} read first at "
++                    "0x{:08X} (outside this function, a branch, or a load of r{}); "
++                    "written back before the transfer\n", ds, rt, succ, rt);
++                continue;
++            }
++            site.dependent.insert(succ);
++        }
++        if (site.dependent.empty()) continue;
++        for (uint32_t succ : site.dependent) {
++            dsl_flush_at_[succ].push_back(ds);
++            fmt::print(stderr,
++                "  [load-delay] delay-slot load 0x{:08X} r{} retires after 0x{:08X}\n",
++                ds, rt, succ);
++        }
++        dsl_sites_[ds] = site;
++    }
++}
++
++std::string CodeGenerator::dsl_decls() const {
++    std::string out;
++    for (const auto& [ds, site] : dsl_sites_) {
++        out += config_.indent + fmt::format(
++            "uint32_t psx_dsl_{0:08X} = 0; int psx_dslp_{0:08X} = 0;  /* delay-slot load r{1} */\n",
++            ds, site.rt);
++        out += config_.indent + fmt::format(
++            "(void)psx_dsl_{0:08X}; (void)psx_dslp_{0:08X};\n", ds);
++    }
++    return out;
++}
++
+ void CodeGenerator::scan_jr_tables(
+     const ControlFlowGraph& cfg,
+     std::map<uint32_t, std::vector<uint32_t>>& out_edges) {
+@@ -3410,6 +3624,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
+     extra_labels_.clear();
+     std::map<uint32_t, std::vector<uint32_t>> jr_table_edges;
+     scan_jr_tables(cfg, jr_table_edges);
++    scan_delay_slot_loads(cfg);
+ 
+     // CPS (§25): collect this alias group's continuations during block
+     // translation (also prevents a stale list from leaking into the next
+@@ -3482,6 +3697,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
+     body << fmt::format("void psx_alias_body_{:08X}(CPUState* cpu, uint32_t entry)\n{{\n",
+                         host);
+     alias_body_decls_.push_back(fmt::format("void psx_alias_body_{:08X}(CPUState* cpu, uint32_t entry)", host));
++    body << dsl_decls();
+     // CPS (§25): a dispatched continuation (callee published cpu->pc = $ra) is
+     // routed into its block here, BEFORE the entry switch — cpu->pc overrides
+     // the `entry` arg. The dispatch routes a continuation by calling the first
+diff --git a/recompiler/tests/test_cop2_delay_slot_load.py b/recompiler/tests/test_cop2_delay_slot_load.py
+new file mode 100644
+index 00000000..ad8e65f0
+--- /dev/null
++++ b/recompiler/tests/test_cop2_delay_slot_load.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++"""Recompiler codegen regression test: MFC2 load delay, in a branch delay slot.
++
++On the R3000A, MFC2/CFC2 write their GPR one instruction late, like LW. Tekken
++2's vertex loop (USA Rev 1, 0x80072890) is software-pipelined around that:
++
++    L:  mtc2  t0, VXY0          # reads the OLD t0: the vertex word from lw
++        ...
++        bgtz  t9, L
++        mfc2  t0, SZ1           # delay slot; t0 lands after L's first insn
++
++Writing t0 at the mfc2 hands VXY0 the depth SZ1 (Y = 0), so every fighter
++vertex batch projects one long spike. This test builds that shape plus an
++in-block `mfc2; addu` pair and checks the emitted C:
++
++- the delay-slot MFC2 writes the psx_dsl_<slot> temp, not the GPR;
++- the taken arm (target reads t0 first) sets psx_dslp_<slot> and the target
++  block retires the write after its first instruction;
++- the fall-through arm (does not read t0 first) writes t0 back at once;
++- the in-block `mfc2 t1; addu t2,t1,t1` pair defers t1 past the addu.
++
++Usage:  python test_cop2_delay_slot_load.py [--recompiler <psxrecomp-game>]
++Exit 0 = PASS.
++"""
++import argparse, glob, os, re, struct, subprocess, sys, tempfile
++
++LOAD = 0x80010000
++LOOP = LOAD + 0x08          # mtc2 t0, $0
++SLOT = LOAD + 0x14          # mfc2 t0, $17 in bgtz's delay slot
++
++WORDS = [
++    0x24190002,  # 0x00 addiu t9, zero, 2
++    0x8C880000,  # 0x04 lw    t0, 0(a0)
++    0x48880000,  # 0x08 L: mtc2 t0, $0      (reads t0 first)
++    0x2739FFFF,  # 0x0C addiu t9, t9, -1
++    0x1F20FFFD,  # 0x10 bgtz  t9, L
++    0x48088800,  # 0x14 mfc2  t0, $17       (delay slot)
++    0x48099000,  # 0x18 mfc2  t1, $18
++    0x01295021,  # 0x1C addu  t2, t1, t1    (in-block dependent successor)
++    0x03E00008,  # 0x20 jr    ra
++    0x00000000,  # 0x24 nop
++]
++
++
++def make_psxexe(entry, load, data):
++    h = bytearray(2048)
++    h[0:8] = b"PS-X EXE"
++    struct.pack_into("<I", h, 0x10, entry)
++    struct.pack_into("<I", h, 0x18, load)
++    struct.pack_into("<I", h, 0x1C, len(data))
++    struct.pack_into("<I", h, 0x30, 0x801FFFF0)
++    return bytes(h) + data
++
++
++def generate(recompiler, tmp):
++    psx = os.path.join(tmp, "t.psx")
++    seeds = os.path.join(tmp, "seeds.txt")
++    out = os.path.join(tmp, "out")
++    os.makedirs(out, exist_ok=True)
++    with open(psx, "wb") as f:
++        f.write(make_psxexe(LOAD, LOAD, b"".join(struct.pack("<I", w) for w in WORDS)))
++    with open(seeds, "w") as f:
++        f.write("0x%08X\n" % LOAD)
++    r = subprocess.run([recompiler, psx, "--seeds", seeds, "--out-dir", out],
++                       capture_output=True, text=True)
++    if r.returncode != 0:
++        raise SystemExit("recompiler failed:\n" + (r.stderr or r.stdout))
++    srcs = glob.glob(os.path.join(out, "*_full*.c"))
++    if not srcs:
++        raise SystemExit("no *_full*.c emitted in " + out)
++    return "".join(open(p, encoding="utf-8", errors="replace").read() for p in srcs)
++
++
++def block(src, addr):
++    """Text of block_<addr> up to the next block label."""
++    m = re.search(r"\nblock_%08X:\n(.*?)(?=\nblock_[0-9A-F]{8}:\n|\Z)" % addr, src, re.S)
++    return m.group(1) if m else ""
++
++
++def main():
++    here = os.path.dirname(os.path.abspath(__file__))
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--recompiler",
++                    default=os.path.normpath(os.path.join(here, "..", "build",
++                                                          "psxrecomp-game")))
++    args = ap.parse_args()
++    if not os.path.isfile(args.recompiler):
++        raise SystemExit("recompiler not found: %s (build it first)" % args.recompiler)
++    with tempfile.TemporaryDirectory() as tmp:
++        src = generate(args.recompiler, tmp)
++
++    temp, flag = "psx_dsl_%08X" % SLOT, "psx_dslp_%08X" % SLOT
++    failures = []
++
++    if not re.search(r"%s = gte_read_data\(cpu, 17\);" % temp, src):
++        failures.append("delay-slot mfc2 does not write %s (t0 written early)" % temp)
++    if re.search(r"cpu->gpr\[8\] = gte_read_data\(cpu, 17\);", src):
++        failures.append("delay-slot mfc2 still writes cpu->gpr[8] directly")
++
++    branch = block(src, LOAD + 0x08)
++    taken, _, not_taken = branch.partition("} else {")
++    if "%s = 1;" % flag not in taken:
++        failures.append("taken arm (target reads t0 first) does not set %s" % flag)
++    if "cpu->gpr[8] = %s;" % temp not in not_taken:
++        failures.append("fall-through arm does not write t0 back from %s" % temp)
++
++    loop = branch.split("/* mtc2 */", 1)
++    if len(loop) != 2 or not re.match(
++            r"\s*(?:PGXP_COP2\([^\n]*\n\s*)?if \(%s\) \{ cpu->gpr\[8\] = %s; %s = 0; \}"
++            % (flag, temp, flag), loop[1]):
++        failures.append("block_%08X does not retire %s right after its mtc2"
++                        % (LOOP, temp))
++    if not re.search(r"if \(!%s && psx_slice_block\(cpu, 0x%08Xu" % (flag, LOOP), src):
++        failures.append("block_%08X may slice away with the load pending" % LOOP)
++    if not re.search(r"uint32_t %s = 0; int %s = 0;" % (temp, flag), src):
++        failures.append("function-scope declarations for %s missing" % temp)
++
++    pair = "psx_ldd_%08X" % (LOAD + 0x18)
++    if not re.search(r"%s = gte_read_data\(cpu, 18\);" % pair, src):
++        failures.append("in-block mfc2 t1; addu t2,t1,t1 is not a load-delay pair")
++    elif not re.search(r"cpu->gpr\[10\] = cpu->gpr\[9\] \+ cpu->gpr\[9\];.*?"
++                       r"cpu->gpr\[9\] = %s;" % pair, src, re.S):
++        failures.append("t1 is written back before the addu reads it")
++
++    if failures:
++        for f in failures:
++            print("FAIL: " + f)
++        raise SystemExit(1)
++    print("COP2 load-delay test passed (slot %s, pair %s)" % (temp, pair))
++
++
++if __name__ == "__main__":
++    main()

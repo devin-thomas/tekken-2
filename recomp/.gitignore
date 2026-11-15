@@ -1,0 +1,28 @@
+# Disc-derived material never goes in git: disc images, the boot EXE,
+# extracted game files, BIOS dumps and generated C (it is a translation of the EXE).
+disc/
+refs/
+extracted/
+generated/
+bios/
+*.bin
+*.BIN
+*.cue
+*.iso
+*.chd
+*.exe
+SLUS_002.13
+SCPH*.BIN
+
+# Build output and local state
+build/
+build-*/
+toolchain/
+scratch/
+saves/
+disc_probe.json
+__pycache__/
+*.pyc
+
+# psxrecomp generate keeps AOT static-overlay work dirs here (disc-derived).
+.cache/

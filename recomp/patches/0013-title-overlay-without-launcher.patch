@@ -1,0 +1,340 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index ffaf8f33..4be0a51c 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -94,6 +94,7 @@
+ #include "host_osd.h"
+ #include "psx_savestate_menu.h"
+ #include "psx_host_menu.h"
++#include "psx_title_hooks.h"   /* Tekken 2 patch 0013: the title's layers */
+ #include "host_time.h"
+ #include "latency_ring.h"
+ #include "gpu_timeline.h"
+@@ -624,6 +625,11 @@ static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) *
+ static int           s_present_w = 0, s_present_h = 0;
+ static GLuint        s_osd_tex = 0;
+ static int           s_osd_tw = 0, s_osd_th = 0;
++/* Tekken 2 patch 0013: the title's layers, a texture each, uploaded only
++ * when their version changes. */
++static GLuint        s_title_tex[2] = {0, 0};
++static int           s_title_tw[2], s_title_th[2];
++static uint32_t      s_title_ver[2];
+ static GLuint        s_present_prog = 0, s_present_vao = 0;
+ static GLuint        s_xr_color_prog = 0, s_xr_native_tex = 0;
+ static GLuint s_xr_surface_program,s_xr_surface_vao,s_xr_surface_vbo,s_xr_surface_tex[2];
+@@ -6748,6 +6754,8 @@ void gl_renderer_shutdown(void) {
+     s_osd_tex = 0;
+     s_osd_tw = 0;
+     s_osd_th = 0;
++    s_title_tex[0] = s_title_tex[1] = 0;
++    s_title_tw[0] = s_title_tw[1] = 0;
+     s_depth24_skip_up = 0;
+     rect_clear(&s_d24_skip_fb);
+     hold_invalidate();
+@@ -9886,24 +9894,38 @@ static void pass_apply_promotion(void) {
+ /* Draw one host OSD ARGB image into the default framebuffer at (vx,vy)
+  * in top-left window coordinates (y down). Bitmap is ow×oh; viewport is
+  * dw×dh (may upscale for HiDPI / large windows). */
++static void gl_draw_osd_image_ex(const uint32_t *px, int ow, int oh,
++                                 int dw, int dh, int vx, int vy, int ww, int wh,
++                                 int blend, GLuint *tex, int *tw, int *th,
++                                 int upload);
+ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+                               int dw, int dh, int vx, int vy, int ww, int wh) {
++    gl_draw_osd_image_ex(px, ow, oh, dw, dh, vx, vy, ww, wh, 0,
++                         &s_osd_tex, &s_osd_tw, &s_osd_th, 1);
++}
++/* Tekken 2 patch 0013: blend is straight-alpha "over" with linear scaling
++ * (the title's layers), 0 the host OSD's opaque nearest draw; the texture
++ * slot is the caller's, refreshed from px when upload is set. */
++static void gl_draw_osd_image_ex(const uint32_t *px, int ow, int oh,
++                                 int dw, int dh, int vx, int vy, int ww, int wh,
++                                 int blend, GLuint *tex, int *tw, int *th,
++                                 int upload) {
+     if (!px || ow <= 0 || oh <= 0 || dw <= 0 || dh <= 0 ||
+         !s_present_prog || ww <= 0 || wh <= 0)
+         return;
+-    if (!s_osd_tex) glGenTextures(1, &s_osd_tex);
++    if (!*tex) { glGenTextures(1, tex); upload = 1; *tw = *th = 0; }
+     p_glActiveTexture(PSXGL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, s_osd_tex);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glBindTexture(GL_TEXTURE_2D, *tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, blend ? GL_LINEAR : GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, blend ? GL_LINEAR : GL_NEAREST);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+-    if (s_osd_tw != ow || s_osd_th != oh) {
++    if (*tw != ow || *th != oh) {
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ow, oh, 0,
+                      GL_BGRA, GL_UNSIGNED_BYTE, px);
+-        s_osd_tw = ow;
+-        s_osd_th = oh;
+-    } else {
++        *tw = ow;
++        *th = oh;
++    } else if (upload) {
+         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ow, oh,
+                         GL_BGRA, GL_UNSIGNED_BYTE, px);
+     }
+@@ -9919,6 +9941,10 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+     glDisable(GL_BLEND);
+     if (p_glBlendEquationSeparate)
+         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
++    if (blend && p_glBlendFuncSeparate) {
++        glEnable(GL_BLEND);
++        p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++    }
+     /* GL viewport origin is bottom-left. */
+     glViewport(vx, wh - vy - dh, dw, dh);
+     p_glUseProgram(s_present_prog);
+@@ -9936,6 +9962,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+         p_glBindVertexArray(0);
+     }
+     p_glUseProgram(0);
++    if (blend) glDisable(GL_BLEND);
+ }
+ 
+ /* Composite host toast + volume bar into the default framebuffer, then swap. */
+@@ -10366,6 +10393,18 @@ static void gl_swap_with_osd(void) {
+             }
+             if (ov_image(3, &px, &ow, &oh) && px)
+                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
++            /* Tekken 2 patch 0013: the title's layers (its settings panel,
++             * FPS readout) over every host overlay, in drawable pixels. */
++            for (int li = 0; li < PSX_TITLE_LAYERS && li < 2; ++li) {
++                PsxTitleLayer tl;
++                memset(&tl, 0, sizeof tl);   /* blended and scaled: not opaque */
++                if (!psx_title_layer(li, ww, wh, 1.0f, &tl)) continue;
++                const int upload = tl.version != s_title_ver[li];
++                s_title_ver[li] = tl.version;
++                gl_draw_osd_image_ex(tl.pixels, tl.w, tl.h, tl.dw, tl.dh,
++                                     tl.x, tl.y, ww, wh, 1, &s_title_tex[li],
++                                     &s_title_tw[li], &s_title_th[li], upload);
++            }
+             /* The title's HUD layer, then the in-game overlay provider
+              * (host_overlay.h P2) over everything; each a no-op unless one
+              * registered. */
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index 146a7238..4ac936eb 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -25,6 +25,7 @@
+ #include "host_osd.h"
+ #include "psx_savestate_menu.h"
+ #include "psx_host_menu.h"
++#include "psx_title_hooks.h"   /* Tekken 2 patch 0013: the title's layers */
+ #include "psx_rewind.h"
+ #include "crash_trace.h"
+ #include "gpu_vk_upload.h"
+@@ -1651,21 +1652,67 @@ static void vk_osd_copy_rect(VkCommandBuffer cb, VkImage sc,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+ }
+ 
++/* Tekken 2 patch 0013: a title layer (psx_title_hooks.h) into the staging
++ * buffer and onto the swapchain. This path copies, so the title gives an
++ * opaque image at swapchain pixels (PsxTitleLayer.opaque); an RGBA swapchain
++ * gets its red and blue swapped on the way. */
++static void vk_title_copy_rect(VkCommandBuffer cb, VkImage sc, const PsxTitleLayer *tl,
++                               int rgba, VkDeviceSize buf_off) {
++    int dw = tl->w, dh = tl->h;
++    if (tl->x < 0 || tl->y < 0) return;
++    if (tl->x + dw > (int)s_sc_extent.width) dw = (int)s_sc_extent.width - tl->x;
++    if (tl->y + dh > (int)s_sc_extent.height) dh = (int)s_sc_extent.height - tl->y;
++    if (dw < 1 || dh < 1) return;
++    uint32_t *dst = (uint32_t *)((uint8_t *)s_osd_map + (size_t)buf_off);
++    const size_t n = (size_t)tl->w * (size_t)tl->h;
++    if (rgba) {
++        for (size_t i = 0; i < n; i++) {
++            const uint32_t v = tl->pixels[i];
++            dst[i] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
++        }
++    } else {
++        memcpy(dst, tl->pixels, n * 4u);
++    }
++    VkBufferImageCopy bc = {0};
++    bc.bufferOffset = buf_off;
++    bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    bc.imageSubresource.layerCount = 1;
++    bc.imageOffset.x = tl->x;
++    bc.imageOffset.y = tl->y;
++    bc.imageExtent.width = (uint32_t)dw;
++    bc.imageExtent.height = (uint32_t)dh;
++    bc.imageExtent.depth = 1;
++    bc.bufferRowLength = (uint32_t)tl->w;
++    bc.bufferImageHeight = (uint32_t)tl->h;
++    p_vkCmdCopyBufferToImage(cb, s_osd_buf, sc,
++                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
++}
++
+ static void vk_osd_blit(VkCommandBuffer cb, VkImage sc) {
+     const uint32_t *text_px = NULL, *vol_px = NULL, *rw_px = NULL, *ssm_px = NULL;
+     int tw = 0, th = 0, vw = 0, vh = 0, rw = 0, rh = 0, sw = 0, sh = 0;
+-    const int have_text = host_osd_image(&text_px, &tw, &th) && text_px;
+-    const int have_vol = host_osd_volume_image(&vol_px, &vw, &vh) && vol_px;
+-    const int have_rw = psx_rewind_overlay_image(&rw_px, &rw, &rh) && rw_px;
+-    const int have_ssm =
+-        psx_host_menu_overlay_image(&ssm_px, &sw, &sh) && ssm_px;
+-    if (!have_text && !have_vol && !have_rw && !have_ssm) {
+-        host_osd_present_done();
+-        return;
+-    }
+     /* Only BGRA swapchains match ARGB8888 LE packing used by host_osd. */
+-    if (s_sc_format != VK_FORMAT_B8G8R8A8_UNORM &&
+-        s_sc_format != VK_FORMAT_B8G8R8A8_SRGB) {
++    const int bgra = s_sc_format == VK_FORMAT_B8G8R8A8_UNORM ||
++                     s_sc_format == VK_FORMAT_B8G8R8A8_SRGB;
++    const int rgba = s_sc_format == VK_FORMAT_R8G8B8A8_UNORM ||
++                     s_sc_format == VK_FORMAT_R8G8B8A8_SRGB;
++    const int have_text = bgra && host_osd_image(&text_px, &tw, &th) && text_px;
++    const int have_vol = bgra && host_osd_volume_image(&vol_px, &vw, &vh) && vol_px;
++    const int have_rw = bgra && psx_rewind_overlay_image(&rw_px, &rw, &rh) && rw_px;
++    const int have_ssm = bgra &&
++        psx_host_menu_overlay_image(&ssm_px, &sw, &sh) && ssm_px;
++    PsxTitleLayer title[PSX_TITLE_LAYERS];
++    int have_title[PSX_TITLE_LAYERS];
++    VkDeviceSize title_bytes = 0;
++    for (int li = 0; li < PSX_TITLE_LAYERS; li++) {
++        memset(&title[li], 0, sizeof title[li]);
++        title[li].opaque = 1;
++        have_title[li] = (bgra || rgba) &&
++            psx_title_layer(li, (int)s_sc_extent.width, (int)s_sc_extent.height, 1.0f, &title[li]) &&
++            title[li].w == title[li].dw && title[li].h == title[li].dh;
++        if (have_title[li]) title_bytes += (VkDeviceSize)title[li].w * (VkDeviceSize)title[li].h * 4u;
++    }
++    if (!have_text && !have_vol && !have_rw && !have_ssm && !title_bytes) {
+         host_osd_present_done();
+         return;
+     }
+@@ -1677,7 +1724,7 @@ static void vk_osd_blit(VkCommandBuffer cb, VkImage sc) {
+         have_rw ? (VkDeviceSize)rw * (VkDeviceSize)rh * 4u : 0;
+     VkDeviceSize ssm_bytes =
+         have_ssm ? (VkDeviceSize)sw * (VkDeviceSize)sh * 4u : 0;
+-    VkDeviceSize bytes = text_bytes + vol_bytes + rw_bytes + ssm_bytes;
++    VkDeviceSize bytes = text_bytes + vol_bytes + rw_bytes + ssm_bytes + title_bytes;
+     if (bytes > s_osd_cap) {
+         p_vkQueueWaitIdle(s_queue);
+         osd_staging_free();
+@@ -1720,6 +1767,12 @@ static void vk_osd_blit(VkCommandBuffer cb, VkImage sc) {
+                     ? (((int)s_sc_extent.height - sh) / 2)
+                     : 0;
+         vk_osd_copy_rect(cb, sc, ssm_px, sw, sh, x, y, off);
++        off += ssm_bytes;
++    }
++    for (int li = 0; li < PSX_TITLE_LAYERS; li++) {
++        if (!have_title[li]) continue;
++        vk_title_copy_rect(cb, sc, &title[li], rgba, off);
++        off += (VkDeviceSize)title[li].w * (VkDeviceSize)title[li].h * 4u;
+     }
+     host_osd_present_done();
+ }
+diff --git a/runtime/src/host_osd.c b/runtime/src/host_osd.c
+index 2a3fa6a0..6295cf54 100644
+--- a/runtime/src/host_osd.c
++++ b/runtime/src/host_osd.c
+@@ -7,6 +7,7 @@
+ #include "psx_rewind.h"
+ #include "psx_savestate_menu.h"
+ #include "psx_host_menu.h"
++#include "psx_title_hooks.h"   /* Tekken 2 patch 0013 */
+ #include "psx_sdl.h"
+ 
+ #include <stdio.h>
+@@ -173,6 +174,10 @@ static int          s_sdl_rw_th;
+ static SDL_Texture *s_sdl_ssm_tex;
+ static int          s_sdl_ssm_tw;
+ static int          s_sdl_ssm_th;
++static SDL_Texture *s_sdl_title_tex[PSX_TITLE_LAYERS];   /* Tekken 2 patch 0013 */
++static int          s_sdl_title_tw[PSX_TITLE_LAYERS];
++static int          s_sdl_title_th[PSX_TITLE_LAYERS];
++static uint32_t     s_sdl_title_ver[PSX_TITLE_LAYERS];
+ static SDL_Renderer *s_sdl_ren;
+ #endif
+ 
+@@ -541,6 +546,44 @@ void host_osd_draw_sdl(struct SDL_Renderer *renderer) {
+             sdl_blit_argb(renderer, &s_sdl_ssm_tex, &s_sdl_ssm_tw,
+                           &s_sdl_ssm_th, px, w, h, 0, 0, lw, lh);
+         }
++        /* Tekken 2 patch 0013: the title's layers over everything, in the
++         * renderer's logical units; px_per_unit lets the title draw them at
++         * the output's own resolution, which SDL scales down to the rect. */
++        {
++            int lw = 640, lh = 480, ow = 0, oh = 0, li;
++            float ppu = 1.0f;
++            sdl_logical_size(renderer, &lw, &lh);
++#if defined(PSX_SDL3)
++            if (SDL_GetCurrentRenderOutputSize(renderer, &ow, &oh) && lw > 0 && lh > 0) {
++#else
++            if (SDL_GetRendererOutputSize(renderer, &ow, &oh) == 0 && lw > 0 && lh > 0) {
++#endif
++                const float sx = (float)ow / (float)lw, sy = (float)oh / (float)lh;
++                ppu = sx < sy ? sx : sy;
++                if (ppu < 1.0f) ppu = 1.0f;
++            }
++            for (li = 0; li < PSX_TITLE_LAYERS; ++li) {
++                PsxTitleLayer tl;
++                memset(&tl, 0, sizeof tl);   /* blended and scaled: not opaque */
++                if (!psx_title_layer(li, lw, lh, ppu, &tl)) continue;
++                if (s_sdl_title_tex[li] && renderer == s_sdl_ren &&
++                    s_sdl_title_tw[li] == tl.w && s_sdl_title_th[li] == tl.h &&
++                    s_sdl_title_ver[li] == tl.version) {
++                    /* unchanged: draw the texture already there */
++                    SDL_Rect d = { tl.x, tl.y, tl.dw, tl.dh };
++#if defined(PSX_SDL3)
++                    (void)psx_sdl_render_copy(renderer, s_sdl_title_tex[li], NULL, &d);
++#else
++                    SDL_RenderCopy(renderer, s_sdl_title_tex[li], NULL, &d);
++#endif
++                    continue;
++                }
++                s_sdl_title_ver[li] = tl.version;
++                sdl_blit_argb(renderer, &s_sdl_title_tex[li], &s_sdl_title_tw[li],
++                              &s_sdl_title_th[li], tl.pixels, tl.w, tl.h,
++                              tl.x, tl.y, tl.dw, tl.dh);
++            }
++        }
+     }
+ #else
+     (void)renderer;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index dbc6bf8d..d59f79a0 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -17681,7 +17681,11 @@ static void recomp_overlay_setup(const char* argv0, const std::string& title) {
+         g_menu_host.default_selection = 1;
+     }
+ #endif
+-    if (!p || g_ovl_on || !g_gl_active || g_headless || (e && *e == '0')) return;
++    /* Tekken 2 patch 0013: a title with its own hooks (psx_title_hooks.h)
++     * draws through its layers, which every renderer composites, so its
++     * provider attaches without OpenGL too (gl_context is then NULL). */
++    if (!p || g_ovl_on || (!g_gl_active && !psx_title_hooks()) || g_headless ||
++        (e && *e == '0')) return;
+     const std::filesystem::path dir = exe_dir_from_argv(argv0);
+     g_ovl_name = title;
+     g_ovl_argv0 = argv0 ? argv0 : "";
+@@ -19029,6 +19033,10 @@ int main(int argc, char** argv) {
+ #if defined(RECOMP_LAUNCHER)
+         g_lnch_settings_path = settings_path;
+         g_overlay_settings_path = settings_path;
++#else
++        /* Tekken 2 patch 0013: a title's own menu saves the player's video
++         * choices (renderer, fullscreen) like the launcher's would. */
++        if (psx_menu_provider()) g_overlay_settings_path = settings_path;
+ #endif
+         PSXRecompV4::UserSettings us =
+             PSXRecompV4::load_user_settings(settings_path);
+@@ -21850,6 +21858,12 @@ session_reboot:
+         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * tex_scale);
+     }
+   }
++    /* Tekken 2 patch 0013: the in-game menu provider on the software and
++     * Vulkan renderers (OpenGL attached above, with its context). */
++    if (!g_gl_active) {
++        psx_video_current(&g_video_boot);
++        recomp_overlay_setup(argv[0], s_picker_game_name);
++    }
+ 
+     /* Staging buffer + backing texture preserve the 576-row interlaced PAL
+      * canvas, times the supersampling factor. Netplay: 1×. */

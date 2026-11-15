@@ -1,0 +1,2 @@
+# Tested with Python 3.14 on macOS; iconutil (macOS) builds the .icns.
+pillow==13.0.0

@@ -1,0 +1,960 @@
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index bba9507f..4f78c2c9 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -814,7 +814,15 @@ struct RuntimeConfig {
+     // games with smoother production cadence may opt into a lower value to
+     // reduce controller-to-sound latency. This is a game-developer setting,
+     // not a player preference.
++#if defined(__ANDROID__)
++    // Tekken 2 patch 0010: phones use the audio bridge's slow-host profile,
++    // which tracks a slow guest instead of needing a deep reserve; 100 ms
++    // covers two 21 ms device callbacks, a guest frame and the measured
++    // swings. [audio] buffer_ms still overrides it.
++    int                   audio_buffer_ms = 100;
++#else
+     int                   audio_buffer_ms = 180;
++#endif
+ 
+     // spu_hq: enable the SPU float-shadow re-render (Catmull-Rom resample, float
+     // headroom). Verified-enhancement, default OFF — spu_render output is
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 427db148..80e0f088 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -2839,6 +2839,12 @@ if(BUILD_TESTING)
+         target_link_libraries(audio_sink_resume_test PRIVATE m)
+     endif()
+     add_test(NAME audio_sink_resume_test COMMAND audio_sink_resume_test)
++    add_executable(audio_slow_host_test tests/test_audio_slow_host.c)
++    target_include_directories(audio_slow_host_test PRIVATE src)
++    if(NOT WIN32)
++        target_link_libraries(audio_slow_host_test PRIVATE m)
++    endif()
++    add_test(NAME audio_slow_host_test COMMAND audio_slow_host_test)
+ endif()
+ 
+ # Focused GPUSTAT fixture: whole-program optimization discards unused renderer paths.
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 280e7a5a..4e613731 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -526,6 +526,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/func_override.c
+     ${PSXRECOMP_ROOT}/runtime/src/game_options.c
+     ${PSXRECOMP_ROOT}/runtime/src/audio_sync.c
++    ${PSXRECOMP_ROOT}/runtime/src/android_perf_hint.c
+     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_speed.c
+     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_debug.c
+     ${PSXRECOMP_ROOT}/runtime/src/debug_bulk_write.c
+diff --git a/runtime/src/android_perf_hint.c b/runtime/src/android_perf_hint.c
+new file mode 100644
+index 00000000..447c6cec
+--- /dev/null
++++ b/runtime/src/android_perf_hint.c
+@@ -0,0 +1,73 @@
++/* android_perf_hint.c (Tekken 2 patch 0010): tells Android how long each
++ * frame's work takes, so the scheduler keeps the game thread on a core and
++ * at a clock that meets the frame period.
++ *
++ * Android's ADPF performance hints (APerformanceHint_*, API 33) take a target
++ * work duration and the measured duration of each frame. Without them the
++ * governor sees a thread that sleeps a little every frame and may run it
++ * slower than it needs; with them it raises the clock only as far as the
++ * frame needs, which also costs less heat than a blanket boost. Loaded with
++ * dlsym, so the app still starts on API 26-32, where this does nothing.
++ * Host policy only: guest timing is not read or changed here. */
++#if defined(__ANDROID__)
++#include <dlfcn.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <unistd.h>
++
++typedef struct APerformanceHintManager APerformanceHintManager;
++typedef struct APerformanceHintSession APerformanceHintSession;
++typedef APerformanceHintManager *(*get_manager_fn)(void);
++typedef APerformanceHintSession *(*create_session_fn)(APerformanceHintManager *,
++                                                       const int32_t *, size_t,
++                                                       int64_t);
++typedef int (*update_target_fn)(APerformanceHintSession *, int64_t);
++typedef int (*report_actual_fn)(APerformanceHintSession *, int64_t);
++
++static int s_state; /* 0 = not tried, 1 = active, -1 = unavailable */
++static APerformanceHintSession *s_session;
++static update_target_fn s_update_target;
++static report_actual_fn s_report_actual;
++static int64_t s_target_ns;
++
++static void perf_hint_init(int64_t target_ns) {
++    s_state = -1;
++    void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
++    if (!lib) return;
++    get_manager_fn get_manager =
++        (get_manager_fn)dlsym(lib, "APerformanceHint_getManager");
++    create_session_fn create_session =
++        (create_session_fn)dlsym(lib, "APerformanceHint_createSession");
++    s_update_target =
++        (update_target_fn)dlsym(lib, "APerformanceHint_updateTargetWorkDuration");
++    s_report_actual =
++        (report_actual_fn)dlsym(lib, "APerformanceHint_reportActualWorkDuration");
++    if (!get_manager || !create_session || !s_update_target || !s_report_actual) {
++        fprintf(stdout, "psxrecomp: android: performance hints unavailable (API < 33)\n");
++        return;
++    }
++    APerformanceHintManager *manager = get_manager();
++    const int32_t tid = (int32_t)gettid();
++    s_session = manager ? create_session(manager, &tid, 1, target_ns) : NULL;
++    if (!s_session) {
++        fprintf(stdout, "psxrecomp: android: performance hint session refused\n");
++        return;
++    }
++    s_target_ns = target_ns;
++    s_state = 1;
++    fprintf(stdout, "psxrecomp: android: performance hints on (game thread %d, "
++                    "target %.2f ms)\n", (int)tid, (double)target_ns / 1e6);
++}
++
++/* Called once per presented-or-skipped guest frame on the game thread with
++ * the frame's work time (everything but the pacer's wait) and the period. */
++void psx_android_perf_frame(int64_t work_ns, int64_t target_ns) {
++    if (s_state == 0) perf_hint_init(target_ns);
++    if (s_state != 1 || work_ns <= 0) return;
++    if (target_ns > 0 && target_ns != s_target_ns) {
++        s_update_target(s_session, target_ns);
++        s_target_ns = target_ns;
++    }
++    s_report_actual(s_session, work_ns);
++}
++#endif
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 5bafbf83..a22e79d3 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -5037,10 +5037,77 @@ static void frame_report_tick(uint64_t frames) {
+     last_real = real;
+ }
+ 
++/* Late-frame present skip ("unshown" frames; Tekken 2 patch 0010). When the
++ * wall-clock pacer is a whole frame period or more behind, the guest frame
++ * that just finished is not presented: the host's upload, scaling and swap
++ * are skipped and the next guest frame starts at once, so the guest keeps its
++ * 59.94 Hz clock and the SPU keeps producing audio at real time; only the
++ * picture drops a frame. At most two frames in a row go unshown. Guest work
++ * (CPU, GPU rasterisation into emulated VRAM, SPU) is never skipped: only the
++ * host present. Default on for Android; PSX_PRESENT_CATCHUP=1/0 overrides on
++ * any platform. Offline wall-paced play only (no netplay, turbo, headless). */
++static uint64_t g_present_unshown = 0;
++static int g_present_catchup_skip = 0;
++static uint64_t g_present_last_pacer_exit = 0;
++
++static int present_catchup_enabled(void) {
++    static int v = -1;
++    if (v < 0) {
++#if defined(__ANDROID__)
++        v = 1;
++#else
++        v = 0;
++#endif
++        if (const char *e = std::getenv("PSX_PRESENT_CATCHUP"); e && *e)
++            v = (*e != '0') ? 1 : 0;
++    }
++    return v;
++}
++
++/* Decide before frame_pacer_wait advances the deadline. */
++static void present_catchup_decide(uint64_t now) {
++    static int consecutive = 0;
++    g_present_catchup_skip = 0;
++    const uint64_t freq = SDL_GetPerformanceFrequency();
++    const uint64_t period = (uint64_t)((double)freq * g_frame_period_ms / 1000.0);
++    const uint64_t deadline = s_frame_pacer.next_deadline;
++    /* Beyond 12 periods frame_pacer_wait forgives the debt (re-anchors), so
++     * skipping there would only drop pictures without repaying anything. */
++    const int behind = present_catchup_enabled() && deadline && period &&
++        now >= deadline + period && now < deadline + period * 12u;
++    if (behind && consecutive < 2) {
++        ++consecutive;
++        g_present_catchup_skip = 1;
++        ++g_present_unshown;
++    } else {
++        consecutive = 0;
++    }
++}
++
++#if defined(__ANDROID__)
++extern "C" void psx_android_perf_frame(int64_t work_ns, int64_t target_ns);
++#endif
++
++/* Frame work time (pacer exit to the next pacer entry) for the platform's
++ * performance hint. */
++static void present_note_frame_work(uint64_t pacer_entry) {
++#if defined(__ANDROID__)
++    if (g_present_last_pacer_exit && pacer_entry > g_present_last_pacer_exit) {
++        const double freq = (double)SDL_GetPerformanceFrequency();
++        psx_android_perf_frame(
++            (int64_t)((double)(pacer_entry - g_present_last_pacer_exit) * 1e9 / freq),
++            (int64_t)(g_frame_period_ms * 1e6));
++    }
++#else
++    (void)pacer_entry;
++#endif
++}
++
+ static void runtime_perf_diag_tick() {
+     static bool have_last = false;
+     static RuntimePerfSnapshot last;
+-    static uint64_t last_spu = 0, last_underruns = 0, last_overflows = 0;
++    static uint64_t last_spu = 0, last_underruns = 0, last_overflows = 0, last_trimmed = 0;
++    static uint64_t last_unshown = 0;
+     static uint64_t last_up[6] = {0};
+     static uint64_t last_overlay_load_us = 0;
+     if (!g_runtime_perf.enabled) return;
+@@ -5059,6 +5126,13 @@ static void runtime_perf_diag_tick() {
+     psx_audio_out_stats(&fill_ms, &target_ms, &underruns, &overflows, &correction,
+                         &legacy, &host_rate);
+     (void)target_ms;
++    /* Tekken 2 patch 0010 (amended): audio dropped at the fill ceiling. */
++    uint64_t trimmed = 0;
++    if (!legacy && s_drc_ready) {
++        rab_stats tst;
++        rab_get_stats(&s_drc, &tst);
++        trimmed = tst.trimmed_frames;
++    }
+     uint64_t up[6] = {0};
+     gl_renderer_runtime_diag(up);
+     uint64_t overlay_load_us = 0, overlay_load_max_us = 0, overlay_load_last_us = 0;
+@@ -5069,6 +5143,7 @@ static void runtime_perf_diag_tick() {
+         last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+         last_underruns = underruns;
+         last_overflows = overflows;
++        last_trimmed = trimmed;
+         last_overlay_load_us = overlay_load_us;
+         for (int i = 0; i < 6; i++) last_up[i] = up[i];
+         have_last = true;
+@@ -5090,7 +5165,8 @@ static void runtime_perf_diag_tick() {
+     const double sim_ms = work_ms;
+     std::fprintf(stdout,
+         "psxrecomp: runtime cadence: guest=%.2f Hz, spu=%.1f Hz, "
+-        "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, corr=%+.5f; "
++        "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, trimmed=+%llu, corr=%+.5f, "
++        "rate=%.4f, unshown=+%llu; "
+         "GL upload=%.1f calls/s %.1f rect/s %.2f Mpix/s, "
+         "cpu=%.1f tex=%.1f draw=%.1f ms/s; "
+         "work guest=%.1f pacer=%.1f canonical=%.1f sim=%.1f "
+@@ -5104,7 +5180,10 @@ static void runtime_perf_diag_tick() {
+         (double)(current.frame - last.frame) / dt,
+         (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
+         fill_ms, (unsigned long long)(underruns - last_underruns),
+-        (unsigned long long)(overflows - last_overflows), correction,
++        (unsigned long long)(overflows - last_overflows),
++        (unsigned long long)(trimmed - last_trimmed), correction,
++        s_drc_ready ? s_drc.stats.rate_estimate : 0.0,
++        (unsigned long long)(g_present_unshown - last_unshown),
+         (double)(up[0] - last_up[0]) / dt,
+         (double)(up[1] - last_up[1]) / dt,
+         (double)(up[2] - last_up[2]) / dt / 1.0e6,
+@@ -5156,6 +5235,8 @@ static void runtime_perf_diag_tick() {
+     last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+     last_underruns = underruns;
+     last_overflows = overflows;
++    last_trimmed = trimmed;
++    last_unshown = g_present_unshown;
+     last_overlay_load_us = overlay_load_us;
+     for (int i = 0; i < 6; i++) last_up[i] = up[i];
+ }
+@@ -10010,8 +10091,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         uint64_t perf_start = runtime_perf_section_begin();
+         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
+             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
++            present_note_frame_work(dyn_t0);
++            present_catchup_decide(dyn_t0);
+             frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+-            const uint64_t waited = SDL_GetPerformanceCounter() - dyn_t0;
++            g_present_last_pacer_exit = SDL_GetPerformanceCounter();
++            const uint64_t waited = g_present_last_pacer_exit - dyn_t0;
+             if (g_dynres.active) g_dynres.pacer_ticks += waited;
+             g_frame_report_wait_ticks += waited;
+         }
+@@ -10055,6 +10139,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     if (gpu_depth24_present_hold_tick())
+         return ep;
+ 
++    /* Late frame: run the next guest frame now instead of presenting this
++     * one (present_catchup_decide). Same exit as the held VBlank above. */
++    if (g_present_catchup_skip) {
++        g_present_catchup_skip = 0;
++        return ep;
++    }
++
+     /* Rollback resim (§33/§47): short catch-up keeps hold-last; long catch-up
+      * periodically presents live Replay VRAM so the display shows progress
+      * while sim stays uncapped. TipHold invent-cap stall uses hold-last from
+@@ -18140,7 +18231,11 @@ int main(int argc, char** argv) {
+     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
+     /* Legacy single deadzone (<0 => keep per-slot / input.ini defaults). */
+     int  resolved_deadzone = -1;
++#if defined(__ANDROID__)
++    int  resolved_audio_buffer_ms = 100;  /* patch 0010: config_loader.h */
++#else
+     int  resolved_audio_buffer_ms = 180;
++#endif
+     /* Localization: the effective language (game.toml default -> settings.toml ->
+      * launcher choice), applied to the translation layer AFTER the launcher runs.
+      * lang_menu_options drives the launcher's "Localization" dropdown (empty =>
+@@ -21335,7 +21430,22 @@ session_reboot:
+     /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
+      * Xbox controller (injected by Steam Input / Remote Play) is enumerated
+      * as a game controller rather than a raw HID device. */
++#if defined(__ANDROID__)
++    /* Tekken 2 patch 0010: on Android, HIDAPI opens a USB controller through
++     * the USB host API: Android asks the player for USB access mid-game
++     * ("could capture audio" for a DualSense), then detaches its own driver
++     * and the pad stops being an Android input device. Off by default, so
++     * pads stay Android input devices over USB and Bluetooth with no prompt.
++     * PSX_ANDROID_HIDAPI=1 opts back in (rumble, lightbar). */
++    const char *android_hidapi_env = std::getenv("PSX_ANDROID_HIDAPI");
++    const bool android_hidapi = android_hidapi_env && android_hidapi_env[0] == '1';
++    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, android_hidapi ? "1" : "0");
++    std::printf("psxrecomp: android: SDL HIDAPI controller driver %s\n",
++                android_hidapi ? "on (PSX_ANDROID_HIDAPI=1)"
++                               : "off (controllers stay Android input devices)");
++#else
+     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
++#endif
+     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+     /* SDL3 aliases the SDL2-era PS5 rumble hint to enhanced reports. Enabling
+      * it also preserves DualSense rumble on the explicit SDL2 fallback. */
+@@ -21346,6 +21456,11 @@ session_reboot:
+      * Xbox One/Series controller would be claimed by nobody -> not a GameController
+      * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
+      * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
++#if defined(__ANDROID__)
++    /* An explicit "1" would keep HIDAPI's Xbox driver (and its USB prompt)
++     * on with the master hint off. */
++    if (android_hidapi)
++#endif
+     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+     if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
+     /* Per-monitor DPI awareness, BEFORE any SDL_Init.
+@@ -21408,6 +21523,18 @@ session_reboot:
+                 cfg.source_rate = 44100.0;            /* SPU render rate */
+                 cfg.host_rate   = (double)have.freq;  /* actual device rate */
+                 cfg.target_ms   = (double)resolved_audio_buffer_ms;
++#if defined(__ANDROID__)
++                /* Tekken 2 patch 0010: a phone's guest can run a few percent
++                 * slow for seconds (thermal limits). Track the producer's
++                 * rate inside +/-12% instead of draining the ring into gaps;
++                 * the target is sized to the device callback. Host output
++                 * only: SPU timing and samples are unchanged. */
++                rab_config_slow_host(&cfg, have.samples);
++                std::printf("psxrecomp: audio: slow-host bridge, target %.0f ms, "
++                            "ring %.0f ms, rate range +/-%.0f%%, restart at %.0f ms\n",
++                            cfg.target_ms, cfg.ring_ms, cfg.max_correction * 100.0,
++                            cfg.reprime_ms);
++#endif
+                 if (rab_init(&s_drc, &cfg) == 0) { s_drc_ready = true; ++audio_bridge_inits; }
+             }
+             g_audio_host_rate = have.freq;
+diff --git a/runtime/src/recomp_audio_drc.h b/runtime/src/recomp_audio_drc.h
+index aa030596..6431775e 100644
+--- a/runtime/src/recomp_audio_drc.h
++++ b/runtime/src/recomp_audio_drc.h
+@@ -51,6 +51,22 @@ typedef struct {
+     double deadband_ms;     /* +/- band around target with no correction (1.0)  */
+     double em_low_ms;       /* below this = underrun emergency (default 12)     */
+     double em_high_ms;      /* above this = overflow emergency (default 235)    */
++    /* Slow-host tolerance (default off: 0 keeps the historical controller).
++     * rate_track_s > 0 tracks the producer's measured rate (source frames
++     * pushed per real second of output) with this low-pass time constant and
++     * adds it to the correction, so a guest that runs a few percent slow for
++     * seconds plays slightly slow instead of draining the ring into gaps.
++     * The total stays inside +/-max_correction; widen that with it. */
++    double rate_track_s;
++    /* Fill at which playback restarts after a true depletion (0 = target_ms).
++     * A lower value shortens the gap a depletion leaves. */
++    double reprime_ms;
++    /* Fill ceiling (0 = off). Above it the consumer drops the oldest audio
++     * back to target in one step with a short crossfade, instead of letting
++     * a catch-up burst sit in the ring as latency until it overflows and is
++     * then shaved off one frame per push (a garbled, pitch-shifted seam).
++     * Ring overflow (no consumer at all) drops to target the same way. */
++    double high_ms;
+ } rab_config;
+ 
+ typedef struct {
+@@ -58,8 +74,10 @@ typedef struct {
+     uint64_t pulled_frames;
+     uint64_t underrun_events;   /* depletion episodes; excludes re-prime silence */
+     uint64_t overflow_drops;    /* source frames dropped on ring overflow     */
++    uint64_t trimmed_frames;    /* source frames dropped at the fill ceiling   */
+     double   last_fill_ms;
+     double   last_correction;   /* applied ratio correction (signed)          */
++    double   rate_estimate;     /* producer rate / real time (rate_track_s>0) */
+ } rab_stats;
+ 
+ typedef struct rab_bridge {
+@@ -79,6 +97,9 @@ typedef struct rab_bridge {
+     double corr;            /* current (slew-limited) correction               */
+     double corr_i;          /* integral term: holds steady clock-skew with
+                                zero standing fill error (see controller)       */
++    double rate_lp;         /* low-passed producer/consumer rate (1 = real time) */
++    uint64_t rate_last_in;  /* in_count at the previous controller update     */
++    int    ever_primed;     /* first prime reached (reprime_ms applies after)  */
+ 
+     /* fade / emergency */
+     double gain;            /* 0..1 smooth gate for startup/underrun           */
+@@ -88,12 +109,17 @@ typedef struct rab_bridge {
+     /* Host-only declick join after intentional output discard, not a queue. */
+     float resume_from[2];
+     int resume_left, resume_total;
++    /* Output crossfade after a trim (consumer side). */
++    float xf_from[2];
++    int xf_left, xf_total;
+     rab_stats stats;
+ } rab_bridge;
+ 
+ /* Fill a config with the locked-in ecosystem defaults. You must still set
+  * channels, source_rate and host_rate afterwards. */
+ void rab_config_defaults(rab_config *c);
++/* Slow-host tolerance profile (see the implementation). */
++void rab_config_slow_host(rab_config *c, int callback_frames);
+ 
+ /* Allocate internal buffers and build the polyphase filter bank. Returns 0 on
+  * success, non-zero on allocation/parameter failure. */
+@@ -168,6 +194,46 @@ void rab_config_defaults(rab_config *c) {
+     c->deadband_ms    = 1.0;
+     c->em_low_ms      = 12.0;
+     c->em_high_ms     = 235.0;
++    c->rate_track_s   = 0.0;
++    c->reprime_ms     = 0.0;
++    c->high_ms        = 0.0;
++}
++
++/* Profile for hosts whose guest can run a few percent slow for seconds at a
++ * time (phones under thermal limits): a lower target sized to the device
++ * callback, room above it for a catch-up burst, producer-rate tracking with a
++ * +/-12% range at a bounded slew, and a half-target restart after a depletion.
++ * Host output policy only: the guest's SPU clock and samples are untouched.
++ * Call after rab_config_defaults and after setting the rates and target. */
++void rab_config_slow_host(rab_config *c, int callback_frames) {
++    const double cb_ms = callback_frames > 0 && c->host_rate > 0.0
++        ? (double)callback_frames * 1000.0 / c->host_rate : 0.0;
++    /* Two device callbacks plus one 60 Hz guest frame must fit under target. */
++    const double floor_ms = 2.0 * cb_ms + 17.0 + 8.0;
++    if (c->target_ms < floor_ms) c->target_ms = floor_ms;
++    c->ring_ms        = c->target_ms * 3.0 < c->target_ms + 160.0
++                            ? c->target_ms + 160.0 : c->target_ms * 3.0;
++    /* 12% covers a guest at ~53 Hz against 59.94 (the Galaxy S21 Ultra's
++     * thermally limited fights logged 53-58 Hz in 10 s windows). Rate
++     * tracking with a 1 s time constant follows a sustained deficit; kp acts
++     * on the fill error before that estimate settles. The 75 ms error
++     * low-pass and an 8 pp/s slew keep each callback's ratio change under
++     * 0.2% (inaudible steps); a guest at full speed stays within ~1%. */
++    c->max_correction = 0.12;
++    c->kp             = 0.10;
++    c->slew_pp_per_s  = 8.0;
++    c->rate_track_s   = 1.0;
++    c->reprime_ms     = c->target_ms * 0.5;
++    c->em_low_ms      = c->target_ms * 0.15;
++    c->em_high_ms     = c->ring_ms - 20.0;
++    /* Recovery (amended 2026-11-14 after the Galaxy's evening session):
++     * after a slow stretch the rate estimate sat at the -12% clamp while the
++     * pacer's catch-up burst refilled the ring, so playback stayed slow, the
++     * fill climbed to ~265 ms and the ring overflowed. The rate term now
++     * only acts in the direction the fill error agrees with (see the
++     * controller), and the fill is capped at 1.8x target: anything above is
++     * late audio, dropped once with a crossfade. */
++    c->high_ms        = c->target_ms * 1.8;
+ }
+ 
+ int rab_init(rab_bridge *b, const rab_config *cfg) {
+@@ -228,6 +294,8 @@ int rab_init(rab_bridge *b, const rab_config *cfg) {
+     b->corr     = 0.0;
+     b->gain     = 0.0;
+     b->primed   = 0;
++    b->rate_lp  = 1.0;
++    b->stats.rate_estimate = 1.0;
+     return 0;
+ }
+ 
+@@ -254,10 +322,22 @@ void rab_push(rab_bridge *b, const int16_t *in, int frames) {
+         if (fill >= cap_lim) {
+             /* Overflow emergency: producer outran consumer past the ring. Drop the
+              * oldest source frame by nudging the read cursor forward. Rare under
+-             * DRC; the resampler's continuous history limits the audible seam. */
+-            b->out_pos += 1.0;
+-            b->stats.overflow_drops++;
+-            fill -= 1.0;
++             * DRC; the resampler's continuous history limits the audible seam.
++             * With a fill ceiling (slow-host profile) drop back to target in
++             * one step instead, so a sustained overrun is one crossfaded seam
++             * per ring, not a frame shaved off every push. */
++            double drop = 1.0;
++            if (b->cfg.high_ms > 0.0) {
++                drop = fill - b->cfg.target_ms * b->cfg.source_rate / 1000.0;
++                if (drop < 1.0) drop = 1.0;
++                drop = floor(drop);
++                b->xf_from[0] = b->last_out[0];
++                b->xf_from[1] = b->last_out[1];
++                b->xf_total = b->xf_left = (int)(b->cfg.host_rate * 0.004);
++            }
++            b->out_pos += drop;
++            b->stats.overflow_drops += (uint64_t)drop;
++            fill -= drop;
+         }
+         int64_t w = (int64_t)(b->in_count % (uint64_t)b->cap);
+         float *slot = b->ring + w * ch;
+@@ -281,7 +361,11 @@ static void rab__update_controller(rab_bridge *b, int pull_frames) {
+     double fill_ms = rab_fill_ms(b);
+     b->stats.last_fill_ms = fill_ms;
+ 
+-    if (!b->primed && fill_ms >= c->target_ms) b->primed = 1;
++    if (!b->primed) {
++        const double prime_ms = (b->ever_primed && c->reprime_ms > 0.0)
++                                    ? c->reprime_ms : c->target_ms;
++        if (fill_ms >= prime_ms) b->primed = b->ever_primed = 1;
++    }
+ 
+     /* One control update per pull. Use the callback's REAL duration: assuming
+      * 12 ms made integral gain and slew run more than twice as fast with common
+@@ -303,7 +387,33 @@ static void rab__update_controller(rab_bridge *b, int pull_frames) {
+      * fill deficit at kp=0.02/target=50 — margin that jitter spikes then
+      * drained to underrun). The integral accumulates the steady skew so fill
+      * returns to target; anti-windup: never integrate deeper into the clamp. */
+-    double target_corr = c->kp * b->err_lp + b->corr_i;
++    /* Producer-rate tracking (slow-host profile). Measured only while the
++     * bridge is playing real audio: refill after a depletion, startup and
++     * intentional sinks must not read as a slow producer. */
++    double rate_term = 0.0;
++    if (c->rate_track_s > 0.0) {
++        const uint64_t in_now = b->in_count;
++        if (b->primed && b->gain >= 1.0 && in_now >= b->rate_last_in) {
++            const double expected =
++                (double)pull_frames * c->source_rate / c->host_rate;
++            double inst = (double)(in_now - b->rate_last_in) / expected;
++            if (inst > 4.0) inst = 4.0; /* one catch-up burst, not a trend */
++            const double a = (dt_ms / 1000.0) / (c->rate_track_s + dt_ms / 1000.0);
++            b->rate_lp += a * (inst - b->rate_lp);
++        }
++        b->rate_last_in = in_now;
++        rate_term = b->rate_lp - 1.0;
++        /* Only where the fill agrees: a ring above target is never played
++         * slower because the producer was slow a moment ago (that is what
++         * turned each catch-up burst into an overflow), and one below
++         * target is never played faster. */
++        if (c->high_ms > 0.0) {
++            if (fill_ms > c->target_ms && rate_term < 0.0) rate_term = 0.0;
++            if (fill_ms < c->target_ms && rate_term > 0.0) rate_term = 0.0;
++        }
++        b->stats.rate_estimate = b->rate_lp;
++    }
++    double target_corr = rate_term + c->kp * b->err_lp + b->corr_i;
+     int clamped_hi = target_corr >  c->max_correction;
+     int clamped_lo = target_corr < -c->max_correction;
+     if ((!clamped_hi && !clamped_lo) ||
+@@ -343,11 +453,27 @@ void rab_resume_after_sink(rab_bridge *b) {
+         b->resume_left = b->resume_total;
+     }
+     b->err_lp = b->corr = b->corr_i = 0.0;
++    b->rate_lp = 1.0;
++    b->rate_last_in = b->in_count;
+     b->cur_step = b->cfg.source_rate / b->cfg.host_rate;
+ }
+ 
+ void rab_pull(rab_bridge *b, int16_t *out, int frames) {
+     int ch = b->cfg.channels;
++    if (b->cfg.high_ms > 0.0 && b->primed && rab_fill_ms(b) > b->cfg.high_ms) {
++        /* Fill ceiling: drop the oldest audio back to target in one step and
++         * crossfade across the cut (4 ms). */
++        const double keep = b->cfg.target_ms * b->cfg.source_rate / 1000.0;
++        const double drop = floor((double)b->in_count - b->out_pos - keep);
++        if (drop > 0.0) {
++            b->out_pos += drop;
++            b->stats.trimmed_frames += (uint64_t)drop;
++            b->xf_from[0] = b->last_out[0];
++            b->xf_from[1] = b->last_out[1];
++            b->xf_total = b->xf_left = (int)(b->cfg.host_rate * 0.004);
++            if (b->xf_total < 1) b->xf_total = b->xf_left = 1;
++        }
++    }
+     rab__update_controller(b, frames);
+ 
+     double gstep = 1.0 / (b->cfg.host_rate * 0.003); /* ~3ms fade in/out */
+@@ -389,6 +515,15 @@ void rab_pull(rab_bridge *b, int16_t *out, int frames) {
+             }
+         }
+ 
++        if (have && b->xf_left > 0) {
++            const float mix = 1.0f - (float)b->xf_left / (float)b->xf_total;
++            s[0] = b->xf_from[0] + (s[0] - b->xf_from[0]) * mix;
++            if (ch == 2) s[1] = b->xf_from[1] + (s[1] - b->xf_from[1]) * mix;
++            b->last_out[0] = s[0];
++            if (ch == 2) b->last_out[1] = s[1];
++            b->xf_left--;
++        }
++
+         /* smooth gate: fade toward 1 when delivering real audio, toward 0 else */
+         double target_gain = have ? 1.0 : 0.0;
+         if (b->gain < target_gain) {
+diff --git a/runtime/tests/test_audio_recovery.c b/runtime/tests/test_audio_recovery.c
+new file mode 100644
+index 00000000..690b4149
+--- /dev/null
++++ b/runtime/tests/test_audio_recovery.c
+@@ -0,0 +1,182 @@
++/* Audio bridge recovery after slow stretches (Tekken 2 patch 0010, amended).
++ *
++ * The Galaxy S21 Ultra's evening session on 2026-11-14 (cadence lines every
++ * 10 s) showed the slow-host profile's failure mode: in a slow window the
++ * rate estimate fell to 0.40-0.75 with the correction pinned at -12%, the
++ * fill at 15-30 ms and dozens of underruns; in the next window the pacer's
++ * catch-up burst landed while playback was still slowed, the fill rose to
++ * ~265-300 ms and the ring overflowed (+983 to +3197 frames dropped one at a
++ * time).
++ *
++ * This simulates the host the way the runtime runs it: a wall-clock pacer
++ * with a 12-period debt window (frame_pacing.c), a guest frame's CPU cost and
++ * a present cost per frame, late frames left unshown (at most two in a row,
++ * patch 0010), and 1024-frame device callbacks at 48 kHz. The script mixes
++ * full-speed play, GPU-heavy stretches that frame skip can absorb, CPU-heavy
++ * stretches it cannot, and hitches (a 120-150 ms frame, as a CD load does).
++ * A hitch longer than the reserve gaps whatever the bridge does (the guest
++ * clock stops); the pins are about the recovery after it.
++ *
++ * Pins: with frame skip keeping the guest clock running there is no gap;
++ * the first profile reproduces the overflow and the ~300 ms fill; the
++ * recovery never overflows, keeps the fill within one guest burst of the
++ * 180 ms ceiling, and adds no more than two gaps where the guest is slower
++ * than the bridge may stretch. Prints both profiles' numbers for the record. */
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#define RECOMP_AUDIO_DRC_IMPL
++#include "recomp_audio_drc.h"
++#include <assert.h>
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++
++typedef struct { double until_s, guest_ms, present_ms, hitch_every_s, hitch_ms; } segment;
++
++typedef struct {
++    uint64_t underruns, overflow, trimmed;
++    double max_fill_ms, guest_hz;
++} sim_result;
++
++static sim_result run(const rab_config *cfg, const segment *seg, int nseg,
++                      double from_s, double to_s) {
++    rab_bridge b;
++    assert(rab_init(&b, cfg) == 0);
++    static int16_t pcm[4096 * 2];
++    static int16_t out[1024 * 2];
++    for (int i = 0; i < 4096; i++) {
++        const int16_t v = (int16_t)(8000.0 * sin(i * 0.0627));
++        pcm[2 * i] = pcm[2 * i + 1] = v;
++    }
++    const double period = 1000.0 / 59.94;
++    const double pull_ms = 1024.0 * 1000.0 / cfg->host_rate;
++    const double spu_per_frame = 44100.0 / 59.94;
++    const double end_ms = seg[nseg - 1].until_s * 1000.0;
++    double now = 0.0, deadline = 0.0, next_pull = pull_ms, spu_debt = 0.0, next_hitch = -1.0;
++    int unshown_run = 0, si = 0;
++    uint64_t frames_in = 0, u0 = 0, o0 = 0, t0 = 0;
++    int counting = 0;
++    sim_result r;
++    memset(&r, 0, sizeof r);
++    while (now < end_ms) {
++        while (si < nseg - 1 && now >= seg[si].until_s * 1000.0) { si++; next_hitch = -1.0; }
++        const segment *s = &seg[si];
++        if (s->hitch_every_s > 0.0 && next_hitch < 0.0) next_hitch = now + s->hitch_every_s * 1000.0;
++        /* one guest frame: CPU work, its SPU output, then present or not */
++        double work = s->guest_ms;
++        if (next_hitch >= 0.0 && now >= next_hitch) {
++            work += s->hitch_ms;
++            next_hitch = now + s->hitch_every_s * 1000.0;
++        }
++        const double frame_end = now + work;
++        /* device callbacks during the frame */
++        while (next_pull <= frame_end) {
++            rab_pull(&b, out, 1024);
++            next_pull += pull_ms;
++            if (counting && b.stats.last_fill_ms > r.max_fill_ms) r.max_fill_ms = b.stats.last_fill_ms;
++        }
++        now = frame_end;
++        spu_debt += spu_per_frame;
++        const int n = (int)spu_debt;
++        spu_debt -= n;
++        rab_push(&b, pcm, n);
++        if (!counting && now >= from_s * 1000.0) {
++            counting = 1;
++            u0 = b.stats.underrun_events; o0 = b.stats.overflow_drops; t0 = b.stats.trimmed_frames;
++            frames_in = 0;
++        }
++        if (counting && now < to_s * 1000.0) frames_in++;
++        if (counting && now >= to_s * 1000.0 && r.guest_hz == 0.0) {
++            r.underruns = b.stats.underrun_events - u0;
++            r.overflow = b.stats.overflow_drops - o0;
++            r.trimmed = b.stats.trimmed_frames - t0;
++            r.guest_hz = (double)frames_in / (to_s - from_s);
++        }
++        /* pacer: present unless a whole period behind (two unshown at most) */
++        if (deadline == 0.0 || now >= deadline + 12.0 * period) deadline = now;   /* re-anchor */
++        const int behind = now >= deadline + period;
++        if (behind && unshown_run < 2) {
++            unshown_run++;
++        } else {
++            unshown_run = 0;
++            const double p_end = now + s->present_ms;
++            while (next_pull <= p_end) { rab_pull(&b, out, 1024); next_pull += pull_ms; }
++            now = p_end;
++        }
++        deadline += period;
++        if (now < deadline) {
++            while (next_pull <= deadline) { rab_pull(&b, out, 1024); next_pull += pull_ms; }
++            now = deadline;
++        }
++    }
++    if (r.guest_hz == 0.0) {   /* the window ran to the end of the script */
++        r.underruns = b.stats.underrun_events - u0;
++        r.overflow = b.stats.overflow_drops - o0;
++        r.trimmed = b.stats.trimmed_frames - t0;
++        r.guest_hz = (double)frames_in / (to_s - from_s);
++    }
++    rab_free(&b);
++    return r;
++}
++
++static void config(rab_config *c, int high) {
++    rab_config_defaults(c);
++    c->channels = 2;
++    c->source_rate = 44100.0;
++    c->host_rate = 48000.0;
++    c->target_ms = 100.0;
++    rab_config_slow_host(c, 1024);
++    if (!high) c->high_ms = 0.0;   /* the profile as first shipped */
++}
++
++static void print(const char *name, sim_result r) {
++    printf("%-44s guest=%.2f Hz underruns=%llu overflow=%llu trimmed=%llu max_fill=%.1f ms\n",
++           name, r.guest_hz, (unsigned long long)r.underruns, (unsigned long long)r.overflow,
++           (unsigned long long)r.trimmed, r.max_fill_ms);
++}
++
++int main(void) {
++    rab_config old_cfg, new_cfg;
++    config(&old_cfg, 0);
++    config(&new_cfg, 1);
++    assert(new_cfg.high_ms == 180.0);
++
++    /* GPU-heavy stretch frame skip absorbs (the old Quick Select cost: 9 ms of
++     * guest work and a 19 ms present). A hitch stops the guest clock itself,
++     * so it is left to the second script. */
++    const segment gpu[] = {
++        { 10.0, 11.0, 3.5, 0.0, 0.0 },
++        { 40.0,  9.0, 19.0, 0.0, 0.0 },
++        { 60.0, 11.0, 3.5, 0.0, 0.0 },
++    };
++    /* CPU-heavy stretches frame skip cannot absorb (a throttled fight: 18-20
++     * ms of guest work), hitches, and full-speed recovery in between: the
++     * evening's 20:07:44-20:08:44 pattern. */
++    const segment cpu[] = {
++        { 10.0, 11.0, 3.5, 0.0, 0.0 },
++        { 20.0, 18.0, 3.5, 3.0, 120.0 },
++        { 30.0, 11.0, 3.5, 0.0, 0.0 },
++        { 40.0, 20.0, 3.5, 2.0, 150.0 },
++        { 50.0, 13.0, 3.5, 2.5, 140.0 },
++        { 70.0, 11.0, 3.5, 0.0, 0.0 },
++    };
++    sim_result a, b2;
++    a = run(&old_cfg, gpu, 3, 10.0, 40.0);  print("first profile, GPU-heavy, frame skip", a);
++    b2 = run(&new_cfg, gpu, 3, 10.0, 40.0); print("recovery, GPU-heavy, frame skip", b2);
++    assert(b2.guest_hz > 59.5);              /* frame skip keeps the clock */
++    assert(b2.underruns == 0 && b2.overflow == 0);
++    assert(b2.max_fill_ms <= new_cfg.high_ms + 40.0);
++
++    a = run(&old_cfg, cpu, 6, 10.0, 70.0);  print("first profile, CPU-heavy + hitches", a);
++    b2 = run(&new_cfg, cpu, 6, 10.0, 70.0); print("recovery, CPU-heavy + hitches", b2);
++    assert(b2.overflow == 0);
++    /* The guest really is 5-17% slow here, past the +/-12% the bridge may
++     * stretch, so gaps remain; the recovery must not add to them. */
++    assert(b2.underruns <= a.underruns + 2);
++    assert(a.overflow > 0 && a.max_fill_ms > 250.0);   /* the evening's failure */
++    assert(b2.max_fill_ms <= new_cfg.high_ms + 40.0);
++
++    puts("PASS audio recovery: no gap while the guest clock runs, no overflow, fill capped");
++    return 0;
++}
+diff --git a/runtime/tests/test_audio_slow_host.c b/runtime/tests/test_audio_slow_host.c
+new file mode 100644
+index 00000000..24fe30dd
+--- /dev/null
++++ b/runtime/tests/test_audio_slow_host.c
+@@ -0,0 +1,168 @@
++/* Audio bridge against a guest that runs slow (Tekken 2 patch 0010).
++ *
++ * Simulates the real pipeline on a 0.25 ms clock: the guest pushes one
++ * frame's SPU output (44100 / 59.94 = 735.7 samples) per guest frame at a
++ * scripted guest rate, and the device pulls 1024-frame callbacks at 48 kHz.
++ * Counts depletions (audible gaps), dropped frames and the largest
++ * correction step between callbacks (pitch glide).
++ *
++ * Pins: the historical defaults are unchanged for a steady guest (desktop);
++ * they gap with a guest a few percent slow (the Galaxy report); the
++ * slow-host profile plays the same scripts without a gap or a dropped
++ * frame. */
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#define RECOMP_AUDIO_DRC_IMPL
++#include "recomp_audio_drc.h"
++#include <assert.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++typedef double (*rate_fn)(double t_s);
++
++typedef struct {
++    uint64_t underruns;     /* after the first prime */
++    uint64_t overflow;
++    double   max_corr;
++    double   max_step;      /* largest |corr| change between callbacks */
++    double   min_fill_ms;
++} sim_result;
++
++static sim_result run(const rab_config *cfg, rate_fn guest_hz, double seconds,
++                      double stall_at_s, double stall_ms) {
++    rab_bridge b;
++    assert(rab_init(&b, cfg) == 0);
++    static int16_t pcm[2048 * 2];
++    static int16_t out[1024 * 2];
++    for (int i = 0; i < 2048; i++) {
++        const int16_t v = (int16_t)(8000.0 * sin(i * 0.0627));
++        pcm[2 * i] = pcm[2 * i + 1] = v;
++    }
++    const double dt = 0.25;               /* ms */
++    const double pull_ms = 1024.0 * 1000.0 / cfg->host_rate;
++    const double spu_per_frame = 44100.0 / 59.94;
++    /* sched is the frame pacer's deadline (one period per guest frame);
++     * a frame cannot start before the host is free. After a stall the pacer
++     * repays its debt with unpaced frames (4 ms each here). */
++    double sched = 0.0, next_guest = 0.0, next_pull = pull_ms, spu_debt = 0.0;
++    double prev_corr = 0.0;
++    int stalled = 0;
++    sim_result r = {0};
++    r.min_fill_ms = 1e9;
++    uint64_t base_underruns = 0;
++    int counting = 0;
++    for (double t = 0.0; t < seconds * 1000.0; t += dt) {
++        if (stall_ms > 0.0 && !stalled && t >= stall_at_s * 1000.0) {
++            next_guest = t + stall_ms;   /* host busy: no guest frame */
++            stalled = 1;
++        }
++        while (t >= next_guest) {
++            spu_debt += spu_per_frame;
++            const int n = (int)spu_debt;
++            spu_debt -= n;
++            rab_push(&b, pcm, n);
++            sched += 1000.0 / guest_hz(t / 1000.0);
++            next_guest = sched > next_guest + 4.0 ? sched : next_guest + 4.0;
++        }
++        if (t >= next_pull) {
++            rab_pull(&b, out, 1024);
++            next_pull += pull_ms;
++            if (!counting && b.primed) {
++                counting = 1;
++                base_underruns = b.stats.underrun_events;
++            }
++            if (counting) {
++                const double c = fabs(b.stats.last_correction);
++                if (c > r.max_corr) r.max_corr = c;
++                const double step = fabs(b.stats.last_correction - prev_corr);
++                if (step > r.max_step) r.max_step = step;
++                if (b.stats.last_fill_ms < r.min_fill_ms)
++                    r.min_fill_ms = b.stats.last_fill_ms;
++            }
++            prev_corr = b.stats.last_correction;
++        }
++    }
++    r.underruns = b.stats.underrun_events - base_underruns;
++    r.overflow = b.stats.overflow_drops;
++    rab_free(&b);
++    return r;
++}
++
++static double steady(double t) { (void)t; return 59.94; }
++static double slow56(double t) { (void)t; return 56.0; }
++/* The Galaxy's log: 10 s windows between 53 and 58.5 Hz, a few seconds at a
++ * time, and short full-speed stretches. */
++static double galaxy(double t) {
++    const double pattern[] = {57.7, 55.1, 53.2, 58.2, 56.5, 59.5, 54.2, 57.9};
++    return pattern[(int)(t / 3.0) % 8];
++}
++
++static void config(rab_config *c, int slow_host, double target_ms) {
++    rab_config_defaults(c);
++    c->channels = 2;
++    c->source_rate = 44100.0;
++    c->host_rate = 48000.0;
++    c->target_ms = target_ms;
++    if (slow_host) rab_config_slow_host(c, 1024);
++}
++
++static void print(const char *name, sim_result r) {
++    printf("%-34s underruns=%llu overflow=%llu max_corr=%.4f max_step=%.5f "
++           "min_fill=%.1f ms\n", name, (unsigned long long)r.underruns,
++           (unsigned long long)r.overflow, r.max_corr, r.max_step, r.min_fill_ms);
++}
++
++int main(void) {
++    rab_config desk, phone;
++    config(&desk, 0, 180.0);
++    config(&phone, 1, 100.0); /* the Android default */
++
++    /* Profile shape. */
++    assert(phone.target_ms == 100.0);
++    assert(phone.ring_ms >= 300.0 && phone.max_correction == 0.12);
++    assert(phone.reprime_ms == 50.0 && phone.rate_track_s > 0.0);
++    rab_config tiny;
++    config(&tiny, 1, 30.0); /* below two 21 ms callbacks + a frame: raised */
++    assert(tiny.target_ms >= 2.0 * 1024 * 1000.0 / 48000.0 + 17.0);
++
++    /* Desktop defaults, steady guest: unchanged behaviour. */
++    sim_result r = run(&desk, steady, 60.0, 0, 0);
++    print("desktop defaults, 59.94 Hz", r);
++    assert(r.underruns == 0 && r.overflow == 0 && r.max_corr <= 0.005 + 1e-9);
++
++    /* Desktop defaults, guest 6.6% slow: the reported gaps. */
++    r = run(&desk, slow56, 60.0, 0, 0);
++    print("desktop defaults, 56 Hz", r);
++    assert(r.underruns > 0);
++    r = run(&desk, galaxy, 60.0, 0, 0);
++    print("desktop defaults, Galaxy pattern", r);
++    assert(r.underruns > 0);
++
++    /* Slow-host profile: no gap, no dropped frame, gentle glide. */
++    r = run(&phone, steady, 60.0, 0, 0);
++    print("slow-host, 59.94 Hz", r);
++    assert(r.underruns == 0 && r.overflow == 0 && r.max_corr < 0.02);
++    r = run(&phone, slow56, 60.0, 0, 0);
++    print("slow-host, 56 Hz", r);
++    assert(r.underruns == 0 && r.overflow == 0);
++    r = run(&phone, galaxy, 90.0, 0, 0);
++    print("slow-host, Galaxy pattern", r);
++    assert(r.underruns == 0 && r.overflow == 0);
++    /* 8 pp/s slew at 21.3 ms callbacks: at most ~0.0017 per callback. */
++    assert(r.max_step < 0.002);
++    /* A stall shorter than the target, then the pacer's catch-up burst: the
++     * reserve covers it and the burst lands in the ring's headroom. */
++    r = run(&phone, steady, 30.0, 10.0, 80.0);
++    print("slow-host, 80 ms stall + catch-up", r);
++    assert(r.underruns == 0 && r.overflow == 0);
++    /* A stall longer than the reserve gaps once (nothing to play), restarts
++     * at half the target and drops nothing. */
++    r = run(&phone, steady, 30.0, 10.0, 150.0);
++    print("slow-host, 150 ms stall + catch-up", r);
++    assert(r.overflow == 0 && r.underruns <= 1);
++
++    puts("PASS slow-host audio bridge: desktop unchanged, slow guest gap-free");
++    return 0;
++}

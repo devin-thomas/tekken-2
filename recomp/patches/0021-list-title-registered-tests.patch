@@ -1,0 +1,15 @@
+diff --git a/runtime/check_test_registration.cmake b/runtime/check_test_registration.cmake
+--- a/runtime/check_test_registration.cmake
++++ b/runtime/check_test_registration.cmake
+@@ -45,6 +45,11 @@
+ set(PSXRECOMP_TESTS_NOT_REGISTERED
+     "test_overlay_posix.c|built and run by tests/run_overlay_posix_test.sh, which stages the dlopen fixture tree; that script is registered as overlay_posix_test on UNIX"
+     "test_openxr_color_gl.c|real-GL fixture compiled and run by tests/run_openxr_color_gl.py (like test_gl_readback_region.c); not a ctest binary"
++    "test_audio_recovery.c|built and run by the Tekken 2 project test tests/test_audio_slow_host.py (Tekken 2 patch 0010)"
++    "test_cd_timing.c|registered as cd_timing_test by runtime/runtime.cmake in a title build (Tekken 2 patch 0008)"
++    "test_gpu_timing.c|registered as gpu_timing_test by runtime/runtime.cmake in a title build (Tekken 2 patch 0006)"
++    "test_sio_timing.c|registered as sio_timing_test by runtime/runtime.cmake in a title build (Tekken 2 patch 0011)"
++    "test_vblank_alignment.c|registered as vblank_alignment_test by runtime/runtime.cmake in a title build (Tekken 2 patch 0009)"
+ )
+ 
+ function(psxrecomp_check_all_tests_registered)

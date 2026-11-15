@@ -1,0 +1,776 @@
+diff --git a/recompiler/CMakeLists.txt b/recompiler/CMakeLists.txt
+index e2bc2ed2..f5c3941d 100644
+--- a/recompiler/CMakeLists.txt
++++ b/recompiler/CMakeLists.txt
+@@ -705,6 +705,32 @@ if(BUILD_TESTING)
+                          ${CMAKE_CURRENT_BINARY_DIR}/draw_distance_interp_stderr.txt)
+     endif()
+ 
++    # R3000A load delay in the dirty-RAM interpreter (Tekken 2 patch 0003):
++    # MFC2/CFC2 and game-RAM loads show the old value to the delay-slot
++    # instruction, including a branch-delay-slot MFC2 into the branch target
++    # (Tekken 2's fighter vertex loop). Twin of cop2_delay_slot_load.
++    if(NOT MSVC)
++        add_executable(interp_load_delay_test
++            ../runtime/tests/test_interp_load_delay.c
++            ../runtime/src/ws_aspect_cone_math.c)
++        target_include_directories(interp_load_delay_test PRIVATE
++            ../runtime/include
++            ../runtime/src)
++        target_compile_options(interp_load_delay_test PRIVATE
++            -O2 -flto -ffunction-sections -fdata-sections)
++        if(APPLE)
++            target_link_options(interp_load_delay_test PRIVATE
++                -flto -Wl,-dead_strip)
++        else()
++            target_link_options(interp_load_delay_test PRIVATE
++                -flto -Wl,--gc-sections)
++        endif()
++        if(NOT WIN32)
++            target_link_libraries(interp_load_delay_test PRIVATE m)
++        endif()
++        add_test(NAME interp_load_delay_test COMMAND interp_load_delay_test)
++    endif()
++
+     # [[mod_immediate.sites]] runtime store, selectors and word substitution
+     # (mod_immediate.c). The interpreter call site is pinned by
+     # runtime/tests/test_interp_mod_immediate_guards.py.
+diff --git a/runtime/include/dirty_ram_interp.h b/runtime/include/dirty_ram_interp.h
+index e9a9620f..2589eed8 100644
+--- a/runtime/include/dirty_ram_interp.h
++++ b/runtime/include/dirty_ram_interp.h
+@@ -70,10 +70,11 @@ void dirty_ram_span_last_failure(DirtyRamSpanFailure *out);
+ void dirty_ram_span_get(uint32_t *lo, uint32_t *hi);
+ void dirty_ram_span_set(uint32_t lo, uint32_t hi);
+ 
+-/* Retire a deferred R3000A load-delay writeback (see dirty_ram_interp.c). The
+- * interpreter defers a load's destination-register write past the delay-slot
+- * instruction, as hardware does; call this anywhere control leaves the
+- * interpreter or an exception is delivered, so no register write is dropped. */
++/* End an R3000A load-delay window (see dirty_ram_interp.c). The interpreter
++ * writes a load's (or MFC2/CFC2's) destination at once and shows the old value
++ * only to the instruction in the delay slot; call this anywhere control leaves
++ * the interpreter or an exception is delivered, so the window does not outlive
++ * the instruction stream it belongs to. */
+ void dirty_ram_ld_delay_flush(CPUState* cpu);
+ 
+ /* Drop a deferred load-delay writeback WITHOUT applying it. Required on
+@@ -90,6 +91,7 @@ void dirty_ram_ld_delay_discard(void);
+ typedef struct DirtyRamLoadDelay {
+     uint32_t rt, val, age;
+     int      armed;
++    uint32_t old, next, seq;   /* hidden value, delay-slot PC, arming step */
+ } DirtyRamLoadDelay;
+ void dirty_ram_ld_delay_save(DirtyRamLoadDelay *out);
+ void dirty_ram_ld_delay_restore(const DirtyRamLoadDelay *in);
+diff --git a/runtime/src/dirty_ram_interp.c b/runtime/src/dirty_ram_interp.c
+index 70044164..6ee2ce0a 100644
+--- a/runtime/src/dirty_ram_interp.c
++++ b/runtime/src/dirty_ram_interp.c
+@@ -336,29 +336,68 @@ int psx_exec_phase(void) { return g_exec_phase; }
+  * permanently unformatted; the send side transmitted one byte 128x).
+  *
+  * Contract: on a same-register conflict the LOAD wins (it retires later),
+- * matching the compiled emitter. Pending state is flushed on interpreter exit
+- * and before exception delivery, where the pipeline would have drained. */
+-static uint32_t s_ld_pend_rt    = 0;
+-static uint32_t s_ld_pend_val   = 0;
+-static uint32_t s_ld_pend_age   = 0;  /* 0 = armed; 1 = delay slot has run */
++ * matching the compiled emitter.
++ *
++ * Tekken 2 patch 0003: game RAM and MFC2/CFC2 too. The value delay used to be
++ * limited to BIOS code, and MFC2/CFC2 were never deferred, because a deferred
++ * write had to be carried across every compiled/interpreted hand-off. Tekken
++ * 2's fighter vertex loop (0x80072890) is software-pipelined around the delay:
++ * `bgtz t9,L; mfc2 t0,SZ1` with `mtc2 t0,VXY0` as L's first instruction, which
++ * must see the OLD t0. An eager MFC2 fed the depth into VXY0 and the fighters
++ * exploded into spikes whenever this loop ran interpreted.
++ *
++ * So the write is now EAGER everywhere, and only the one instruction that
++ * architecturally sits in the delay slot is shown the old value: the load
++ * leaves a token {rt, old, new, PC of its delay slot}. When the next
++ * interpreted instruction is exactly that PC and rt still holds the loaded
++ * value, rt is set back to the old value for that instruction alone and the
++ * loaded value is put back after it. Anything else that runs first (compiled
++ * code, an exception handler, another entry) sees the loaded value, exactly as
++ * the eager interpreter always did, and makes the token stale. Nothing is
++ * ever written late, so no hand-off can be clobbered by a late write.
++ *
++ * A load in a branch's delay slot gets its token's PC from the branch once
++ * the branch commits (the transfer target or the fall-through), provided no
++ * other interpreted instruction ran in between and the branch went where it
++ * encodes. A call whose callee already ran inline drops the token. A branch
++ * shown the old value lands the load when its own delay slot starts. */
++enum { LD_ARMED = 0u, LD_HIDING = 1u, LD_UNRESOLVED = 2u };
++static uint32_t s_ld_pend_rt    = 0;  /* destination GPR                       */
++static uint32_t s_ld_pend_val   = 0;  /* loaded value (already in the GPR)     */
++static uint32_t s_ld_pend_old   = 0;  /* value the delay slot must see         */
++static uint32_t s_ld_pend_next  = 0;  /* PC of the delay-slot instruction      */
++static uint32_t s_ld_pend_seq   = 0;  /* s_ld_step of the arming instruction   */
++static uint32_t s_ld_pend_age   = 0;  /* LD_ARMED / LD_HIDING / LD_UNRESOLVED  */
+ static int      s_ld_pend_armed = 0;
++static uint32_t s_ld_step       = 0;  /* exec_one_fetched entries              */
++static int      s_ld_in_delay_slot = 0; /* set by exec_delay_slot for one call */
++
++/* The delay-slot instruction is done (or something else ran first): the load
++ * has landed. Restores the loaded value only while it is hidden. */
++static inline void ld_delay_land(CPUState *cpu) {
++    if (s_ld_pend_armed && s_ld_pend_age == LD_HIDING && s_ld_pend_rt != 0u)
++        cpu->gpr[s_ld_pend_rt] = s_ld_pend_val;
++    s_ld_pend_armed = 0;
++    s_ld_pend_age   = LD_ARMED;
++    cpu->gpr[0] = 0;
++}
+ 
+-/* Retire a deferred load writeback. Call wherever the interpreter stops
+- * stepping instructions (hand-off to compiled code, exception entry), since
+- * nothing downstream knows about the pending register write. */
++/* Drop the token where the interpreter stops stepping instructions (hand-off
++ * to compiled code, exception entry): the loaded value is already in place. */
+ void dirty_ram_ld_delay_flush(CPUState *cpu) {
+     if (!s_ld_pend_armed) return;
+-    s_ld_pend_armed = 0;
+-    s_ld_pend_age   = 0;
+-    if (s_ld_pend_rt != 0u) cpu->gpr[s_ld_pend_rt] = s_ld_pend_val;
+-    cpu->gpr[0] = 0;
++    ld_delay_land(cpu);
+ }
+ 
+ void dirty_ram_ld_delay_discard(void) {
+     s_ld_pend_armed = 0;
+-    s_ld_pend_age   = 0;
++    s_ld_pend_age   = LD_ARMED;
+     s_ld_pend_rt    = 0;
+     s_ld_pend_val   = 0;
++    s_ld_pend_old   = 0;
++    s_ld_pend_next  = 0;
++    s_ld_pend_seq   = 0;
++    s_ld_in_delay_slot = 0;
+ }
+ 
+ void dirty_ram_ld_delay_save(DirtyRamLoadDelay *out) {
+@@ -367,6 +406,9 @@ void dirty_ram_ld_delay_save(DirtyRamLoadDelay *out) {
+     out->val = s_ld_pend_val;
+     out->age = s_ld_pend_age;
+     out->armed = s_ld_pend_armed;
++    out->old = s_ld_pend_old;
++    out->next = s_ld_pend_next;
++    out->seq = s_ld_pend_seq;
+ }
+ 
+ void dirty_ram_ld_delay_restore(const DirtyRamLoadDelay *in) {
+@@ -375,6 +417,10 @@ void dirty_ram_ld_delay_restore(const DirtyRamLoadDelay *in) {
+     s_ld_pend_val = in->val;
+     s_ld_pend_age = in->age;
+     s_ld_pend_armed = in->armed;
++    s_ld_pend_old = in->old;
++    s_ld_pend_next = in->next;
++    s_ld_pend_seq = in->seq;
++    s_ld_in_delay_slot = 0;
+ }
+ 
+ void dirty_ram_irq_ambient_resync_after_restore(void) {
+@@ -1491,6 +1537,7 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
+         return;
+     }
+     uint32_t dummy_next = 0;
++    s_ld_in_delay_slot = 1; /* a load here: its delay slot is the transfer target */
+     (void)exec_one_fetched(cpu, pc, insn, &dummy_next);
+     g_dirty_ram_insns_run++;
+     /* CYCLE MODEL: the delay-slot instruction is a real retired R3000A instruction
+@@ -1499,45 +1546,44 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
+      * pair costs both, matching hardware. No separate charge here. */
+ }
+ 
+-/* Load-delay shim around the decoder (see dirty_ram_ld_delay_flush above).
+- * Wrapping here keeps every individual load case untouched: the inner decoder
+- * still writes gpr[rt] eagerly, and we roll that write back by one instruction
+- * so the delay-slot instruction observes the architecturally-correct value. */
++/* Load-delay shim around the decoder (see the load-delay section above).
++ * Every individual load case stays untouched and writes gpr[rt] at once; this
++ * wrapper shows the old value to the one instruction in the delay slot. */
+ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
+                                   uint32_t *next_pc_out, uint32_t original_instruction);
+ 
+ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
+                             uint32_t *next_pc_out) {
+-    /* A load's writeback becomes visible to the instruction AFTER its delay
+-     * slot: load at N, hidden from N+1, visible from N+2. s_ld_pend_age tracks
+-     * that: 0 = armed by the instruction just executed, 1 = the delay slot has
+-     * now run, so retire it before executing anything else.
+-     *
+-     * Doing the retire HERE (rather than after the slot returns) is what makes
+-     * branches correct: a branch's own delay slot is executed nested inside
+-     * exec_one_fetched_inner, and re-enters this wrapper — by then age is 1, so
+-     * the slot correctly observes the loaded value. */
+-    if (s_ld_pend_armed && s_ld_pend_age != 0u) {
+-        s_ld_pend_armed = 0;
+-        if (s_ld_pend_rt != 0u) cpu->gpr[s_ld_pend_rt] = s_ld_pend_val;
+-        cpu->gpr[0] = 0;
++    const uint32_t ld_step = ++s_ld_step;
++    const int ld_in_slot = s_ld_in_delay_slot;
++    s_ld_in_delay_slot = 0;
++    int ld_hiding = 0;
++    if (s_ld_pend_armed && s_ld_pend_age == LD_HIDING) {
++        /* Nested inside the delay-slot instruction: it is a branch or jump
++         * starting its own delay slot, so the load has landed. */
++        ld_delay_land(cpu);
+     } else if (s_ld_pend_armed) {
++        const uint32_t nx_op = op_field(insn);
++        const uint32_t nx_fn = funct_field(insn);
+         /* LWL/LWR exemption. `lwl rt,x` immediately followed by `lwr rt,y` is
+          * THE unaligned-load idiom every MIPS compiler emits, and MIPS-I
+          * explicitly permits the pair back-to-back: the second half merges with
+          * the first's result rather than the pre-load register. Hiding the
+-         * pending write here would make the merge read a stale rt and silently
+-         * corrupt every unaligned load (it wedged Tomba 2 at boot). Retire the
+-         * write early so the partner sees it — this is forwarding, not a
+-         * shortcut around the delay slot. */
+-        const uint32_t nx_op = op_field(insn);
+-        const int is_lwlr = (nx_op == 0x22u || nx_op == 0x26u);
+-        if (is_lwlr && rt_field(insn) == s_ld_pend_rt) {
+-            s_ld_pend_armed = 0;
+-            if (s_ld_pend_rt != 0u) cpu->gpr[s_ld_pend_rt] = s_ld_pend_val;
+-            cpu->gpr[0] = 0;
++         * loaded value here would make the merge read a stale rt and silently
++         * corrupt every unaligned load (it wedged Tomba 2 at boot): forwarding.
++         * SYSCALL/BREAK in the slot: the exception drains the pipeline, so the
++         * handler sees the loaded value. */
++        const int is_lwlr = (nx_op == 0x22u || nx_op == 0x26u) &&
++                            rt_field(insn) == s_ld_pend_rt;
++        const int is_trap = nx_op == 0x00u && (nx_fn == 0x0Cu || nx_fn == 0x0Du);
++        if (s_ld_pend_age == LD_ARMED && dirty_ram_same_pc(pc, s_ld_pend_next) &&
++            cpu->gpr[s_ld_pend_rt] == s_ld_pend_val && !is_lwlr && !is_trap) {
++            cpu->gpr[s_ld_pend_rt] = s_ld_pend_old; /* this IS the delay slot */
++            s_ld_pend_age = LD_HIDING;
++            ld_hiding = 1;
+         } else {
+-            s_ld_pend_age = 1u; /* this instruction IS the delay slot: stay hidden */
++            s_ld_pend_armed = 0; /* stale, or forwarded: the value is in place */
++            s_ld_pend_age   = LD_ARMED;
+         }
+     }
+ 
+@@ -1547,23 +1593,31 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
+      * guest's bytes (and the guard above) stay the original instruction. */
+     if (g_psx_mod_immediate_live) insn = psx_mod_immediate_patch(pc, insn);
+ 
+-    /* op 0x20..0x26 = LB/LH/LWL/LW/LBU/LHU/LWR. LWC2 (GTE, 0x32) targets a COP2
+-     * register, not a GPR, so it needs no deferral here. */
++    /* op 0x20..0x26 = LB/LH/LWL/LW/LBU/LHU/LWR, and COP2 MFC2/CFC2 (op 0x12,
++     * rs 0/2), which write their GPR one instruction late exactly like LW.
++     * LWC2 (GTE, 0x32) targets a COP2 register, not a GPR, so it needs no
++     * delay here. Once limited to BIOS ROM and kernel RAM; the eager-write
++     * token above made game RAM safe (Tekken 2 patch 0003). */
+     const uint32_t ld_op = op_field(insn);
+     const uint32_t ld_rt = rt_field(insn);
+-    const uint32_t pc_phys = pc & 0x1FFFFFFFu;
+-    /* OpenBIOS executes cardfasttrack both from ROM and from its low-RAM
+-     * kernel copy (for example 0x3554..0x36D4). Its hand-written dependent
+-     * load requires the real R3000A value delay. Game-owned dirty RAM crosses
+-     * mixed compiled/interpreted boundaries that do not carry this pending
+-     * writeback yet, so preserve the historical eager-value contract there. */
+-    const int      in_bios_rom =
+-        pc_phys >= 0x1FC00000u && pc_phys < 0x1FC80000u;
+-    const int      in_bios_kernel_ram = pc_phys < 0x00010000u;
+-    const int      is_ld = (in_bios_rom || in_bios_kernel_ram) &&
+-                           (ld_op >= 0x20u && ld_op <= 0x26u) &&
++    const int      is_gte_read = ld_op == 0x12u &&
++                                 (rs_field(insn) == 0x00u || rs_field(insn) == 0x02u);
++    const int      is_ld = ((ld_op >= 0x20u && ld_op <= 0x26u) || is_gte_read) &&
+                            (ld_rt != 0u);
+     const uint32_t ld_before = is_ld ? cpu->gpr[ld_rt] : 0u;
++    /* Where this instruction transfers to if it is a branch or jump, for a
++     * load in its delay slot (registers as this instruction reads them). */
++    uint32_t ld_xfer_a = 0xFFFFFFFFu, ld_xfer_b = 0xFFFFFFFFu;
++    if ((ld_op >= 0x04u && ld_op <= 0x07u) ||
++        (ld_op == 0x01u && (ld_rt == 0x00u || ld_rt == 0x01u ||
++                            ld_rt == 0x10u || ld_rt == 0x11u))) {
++        ld_xfer_a = pc + 4u + ((uint32_t)simm16_field(insn) << 2);
++        ld_xfer_b = pc + 8u;
++    } else if (ld_op == 0x02u || ld_op == 0x03u) {
++        ld_xfer_a = ((pc + 4u) & 0xF0000000u) | ((insn & 0x03FFFFFFu) << 2);
++    } else if (ld_op == 0x00u && (funct_field(insn) == 0x08u || funct_field(insn) == 0x09u)) {
++        ld_xfer_a = cpu->gpr[rs_field(insn)];
++    }
+ 
+     /* [[draw_distance.clamp]] (draw_distance.h): while a mod has the clamps
+      * on, a listed main-EXE site clamps its register before it runs, exactly
+@@ -1583,22 +1637,40 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
+ 
+     const int rv = exec_one_fetched_inner(cpu, pc, insn, next_pc_out, original_instruction);
+ 
++    if (ld_hiding && s_ld_pend_armed && s_ld_pend_age == LD_HIDING) {
++        /* The delay-slot instruction has retired: the load lands. It wins a
++         * same-register write, except against a load in its delay slot, which
++         * retires later. */
++        s_ld_pend_armed = 0;
++        s_ld_pend_age   = LD_ARMED;
++        if (!(is_ld && ld_rt == s_ld_pend_rt)) cpu->gpr[s_ld_pend_rt] = s_ld_pend_val;
++        cpu->gpr[0] = 0;
++    }
++
+     if (is_ld) {
+         const uint32_t loaded = cpu->gpr[ld_rt];
+         if (loaded != ld_before) {
+-            /* Back-to-back loads: retire the older writeback before reusing the
+-             * slot, otherwise its register write would be dropped entirely. */
+-            if (s_ld_pend_armed && s_ld_pend_rt != ld_rt && s_ld_pend_rt != 0u)
+-                cpu->gpr[s_ld_pend_rt] = s_ld_pend_val;
+-            /* Undo the eager write; it becomes visible one instruction later.
+-             * On a same-register conflict this naturally makes the LOAD win,
+-             * matching what the compiled backend emits for a dependent pair. */
+-            cpu->gpr[ld_rt] = ld_before;
++            /* The register keeps the loaded value; only the next instruction
++             * (pc + 4, or the branch target when this is a delay slot) is
++             * shown ld_before. */
+             s_ld_pend_rt    = ld_rt;
+             s_ld_pend_val   = loaded;
+-            s_ld_pend_age   = 0u;
++            s_ld_pend_old   = ld_before;
++            s_ld_pend_seq   = ld_step;
++            s_ld_pend_next  = pc + 4u;
++            s_ld_pend_age   = ld_in_slot ? LD_UNRESOLVED : LD_ARMED;
+             s_ld_pend_armed = 1;
+-            cpu->gpr[0]     = 0;
++        }
++    } else if (s_ld_pend_armed && s_ld_pend_age == LD_UNRESOLVED) {
++        /* A load ran in this instruction's delay slot. Its own delay slot is
++         * where this transfer lands, if nothing else ran in between. */
++        if (rv == 1 && s_ld_pend_seq == ld_step + 1u && s_ld_step == ld_step + 1u &&
++            (cpu->pc == ld_xfer_a || cpu->pc == ld_xfer_b)) {
++            s_ld_pend_next = cpu->pc;
++            s_ld_pend_age  = LD_ARMED;
++        } else {
++            s_ld_pend_armed = 0;
++            s_ld_pend_age   = LD_ARMED;
+         }
+     }
+     return rv;
+diff --git a/runtime/tests/test_interp_load_delay.c b/runtime/tests/test_interp_load_delay.c
+new file mode 100644
+index 00000000..75a7155e
+--- /dev/null
++++ b/runtime/tests/test_interp_load_delay.c
+@@ -0,0 +1,421 @@
++/* R3000A load delay in the dirty-RAM interpreter, game RAM and COP2.
++ *
++ * Interpreter-side twin of recompiler/tests/test_cop2_delay_slot_load.py
++ * (Tekken 2 patch 0002, the emitter). MFC2/CFC2 write their GPR one
++ * instruction late, like LW; the instruction in the delay slot sees the old
++ * value. Tekken 2's fighter vertex loop (0x80072890) depends on it:
++ *
++ *     L:  mtc2  t0, VXY0       # must see the OLD t0 (the lw below)
++ *         ...
++ *         lw    t0, 0(t8)
++ *         ...
++ *         bgtz  t9, L
++ *         mfc2  t0, SZ1        # delay slot: t0 lands after L's mtc2
++ *
++ * Before Tekken 2 patch 0003 the interpreter modelled the delay only for
++ * ordinary loads in BIOS code, so this loop, run interpreted (overlays,
++ * PSX_FORCE_INTERP=1), fed SZ1 into VXY0 and the fighters became spikes.
++ *
++ * Covers: the loop shape (branch-delay-slot MFC2 into the target's first
++ * instruction, and into the fall-through), in-block MFC2/CFC2/LW pairs in game
++ * RAM, a branch in a load's delay slot (it sees the old value, its own slot
++ * the new one), the load winning a same-register ALU write, LWL/LWR
++ * forwarding, a load in a JAL delay slot with an interpreted callee (hidden
++ * from its first instruction) and with a compiled callee (the return site is
++ * not shown a stale value), SYSCALL in the slot, a register changed behind the
++ * interpreter's back, and flush/discard.
++ *
++ * Sources are #included as in test_ws_cull_edge_interp.c; link-time dead-code
++ * removal keeps the stub set small. */
++#include "../src/gpu.c"
++#include "../src/mod_immediate.c"
++#include "../src/dirty_ram_interp.c"
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++
++/* ---- link stubs for code reachable from exec_one_fetched ------------------ */
++uint64_t s_frame_count;
++uint32_t g_debug_current_func_addr;
++uint32_t g_debug_last_store_pc;
++uint32_t g_dirty_ram_code_gen;
++uint64_t g_dispatch_static_hits;
++uint32_t g_psx_mod_instruction_hooks;
++/* The interpreter consults the optional override tier even in this isolated
++ * culling fixture. No overrides are registered here. */
++int (*g_psx_func_override_hook)(CPUState *, uint32_t);
++uint32_t psx_mod_memory_address(const CPUState *cpu, uint32_t pc, uint32_t word, uint32_t address) {
++    (void)cpu; (void)pc; (void)word; return address;
++}
++void psx_mod_instruction(CPUState *cpu, uint32_t pc, uint32_t instruction) {
++    (void)cpu; (void)pc; (void)instruction; abort();
++}
++int      g_rfe_escape_pending;
++int      g_exc_escape_reason;
++int      g_psx_call_bail;
++uint64_t g_psx_bail_first;
++uint64_t g_psx_bail_resolved;
++uint32_t i_stat;
++uint32_t i_mask;
++uint64_t psx_cycle_count;
++/* Live RAM geometry (memory.c): retail 2 MiB, as the stub RAM below. */
++uint32_t g_psx_ram_size = PSX_MAIN_RAM_RETAIL_BYTES;
++uint32_t g_psx_ram_mask = PSX_MAIN_RAM_RETAIL_BYTES - 1u;
++
++static uint8_t test_ram[0x00200000u];
++
++uint8_t *memory_get_ram_ptr(void) { return test_ram; }
++uint8_t psx_read_byte(uint32_t a) { return test_ram[a & 0x1FFFFFu]; }
++uint16_t psx_read_half(uint32_t a) {
++    uint16_t v; memcpy(&v, test_ram + (a & 0x1FFFFEu), sizeof v); return v;
++}
++uint32_t psx_read_word(uint32_t a) {
++    uint32_t v; memcpy(&v, test_ram + (a & 0x1FFFFCu), sizeof v); return v;
++}
++uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t a, uint32_t rt, uint32_t m) {
++    (void)cpu; (void)rt; (void)m; return psx_read_byte(a);
++}
++uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t a) { (void)cpu; return psx_read_word(a); }
++/* Every page is dirty (interpreted) except NONLOCAL_PAGE, which stands for
++ * compiled code reached through psx_dispatch_call. */
++#define NONLOCAL_FN 0x80030000u
++int dirty_ram_is_dirty(uint32_t phys) { return ((phys & 0x1FFFFFFFu) >> 12) != ((NONLOCAL_FN & 0x1FFFFFFFu) >> 12); }
++int mdec_recently_active(uint32_t f) { (void)f; return 0; }
++void gte_execute(CPUState *cpu, uint32_t cmd) { (void)cpu; (void)cmd; }
++static int precise_sign_valid, precise_sign;
++static int previous_sign_valid, previous_sign;
++int gte_nclip_zero_positive(int32_t mac0, uint32_t pc) {
++    (void)mac0; (void)pc; return 0;
++}
++int gte_nclip_native_wide_sign(int32_t mac0, int* sign) {
++    (void)mac0; *sign = precise_sign; return precise_sign_valid;
++}
++int gte_nclip_native_wide_previous_sign(int32_t mac0, int* sign) {
++    (void)mac0; *sign = previous_sign; return previous_sign_valid;
++}
++void gte_precision_store_word(uint32_t a, uint8_t r) { (void)a; (void)r; }
++/* GTE: MFC2/CFC2 read gte_data[]/gte_ctrl[]; MTC2 writes are logged. */
++static uint32_t gte_data[32], gte_ctrl[32];
++static uint32_t mtc2_log[16]; static uint8_t mtc2_reg[16]; static int mtc2_n;
++uint32_t gte_read_ctrl(CPUState *cpu, uint8_t r) { (void)cpu; return gte_ctrl[r & 31u]; }
++uint32_t gte_read_data(CPUState *cpu, uint8_t r) { (void)cpu; return gte_data[r & 31u]; }
++void gte_write_ctrl(CPUState *cpu, uint8_t r, uint32_t v) { (void)cpu; gte_ctrl[r & 31u] = v; }
++void gte_write_data(CPUState *cpu, uint8_t r, uint32_t v) {
++    (void)cpu;
++    if (mtc2_n < 16) { mtc2_reg[mtc2_n] = r; mtc2_log[mtc2_n++] = v; }
++}
++int overlay_loader_call_native(CPUState *cpu, uint32_t a) { (void)cpu; (void)a; return 0; }
++void psx_bail_record(uint32_t ra, uint32_t sp, uint32_t pc, uint32_t gsp) {
++    (void)ra; (void)sp; (void)pc; (void)gsp;
++}
++void psx_break(CPUState *cpu, uint32_t code, uint32_t pc) { (void)cpu; (void)code; (void)pc; }
++void psx_check_interrupts(struct CPUState *cpu) { (void)cpu; }
++/* Compiled callee: records what it was entered with. */
++static uint32_t call_target, call_a0; static int call_n;
++void psx_dispatch_call(CPUState *cpu, uint32_t t, uint32_t r) {
++    (void)r; call_target = t; call_a0 = cpu->gpr[4]; call_n++;
++}
++void psx_fatal_halt(const char *reason) { fprintf(stderr, "fatal: %s\n", reason); exit(2); }
++void psx_get_freeze_diag(uint64_t *a, uint32_t *b, int *c, int *d, uint64_t *e,
++                         uint64_t *f) {
++    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
++}
++int psx_get_in_exception(void) { return 0; }
++int psx_interrupts_checked_at_current_cycle(uint32_t pc) { (void)pc; return 1; }
++void psx_pgxp_alu(struct CPUState *c, uint32_t i, uint32_t r, uint32_t a, uint32_t b) {
++    (void)c; (void)i; (void)r; (void)a; (void)b;
++}
++void psx_pgxp_cop2(struct CPUState *c, uint32_t i, uint32_t v, uint32_t a) {
++    (void)c; (void)i; (void)v; (void)a;
++}
++void psx_pgxp_load(struct CPUState *c, uint32_t i, uint32_t a, uint32_t v) {
++    (void)c; (void)i; (void)a; (void)v;
++}
++void psx_pgxp_muldiv(struct CPUState *c, uint32_t i, uint32_t h, uint32_t l,
++                     uint32_t a, uint32_t b) {
++    (void)c; (void)i; (void)h; (void)l; (void)a; (void)b;
++}
++void psx_pgxp_store(struct CPUState *c, uint32_t i, uint32_t a, uint32_t v) {
++    (void)c; (void)i; (void)a; (void)v;
++}
++void psx_rfe_mark_escape(void) {}
++static uint32_t syscall_a0; static int syscall_n;
++int psx_syscall(CPUState *cpu, uint32_t code) {
++    (void)code; syscall_a0 = cpu->gpr[4]; syscall_n++; cpu->pc += 4u; return 0;
++}
++
++
++/* ---- harness --------------------------------------------------------------- */
++static int failures;
++#define CHECK(cond, ...)                                                      \
++    do {                                                                      \
++        if (!(cond)) {                                                        \
++            fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);              \
++            fprintf(stderr, __VA_ARGS__);                                     \
++            fputc('\n', stderr);                                              \
++            ++failures;                                                       \
++        }                                                                     \
++    } while (0)
++
++enum { ZERO = 0, A0 = 4, T0 = 8, T1 = 9, T2 = 10, T3 = 11, T8 = 24, T9 = 25 };
++enum { VXY0 = 0, SZ1 = 17, CTRL_H = 26 };
++#define CODE 0x80020000u /* game RAM, outside the old BIOS-only window */
++#define DATA 0x80040000u
++
++static uint32_t i_type(uint32_t op, uint32_t rs, uint32_t rt, uint16_t imm) {
++    return (op << 26) | (rs << 21) | (rt << 16) | imm;
++}
++static uint32_t r_type(uint32_t rs, uint32_t rt, uint32_t rd, uint32_t fn) {
++    return (rs << 21) | (rt << 16) | (rd << 11) | fn;
++}
++static uint32_t cop2(uint32_t op, uint32_t rt, uint32_t rd) {
++    return (0x12u << 26) | (op << 21) | (rt << 16) | (rd << 11);
++}
++#define NOP            0u
++#define MFC2(rt, rd)   cop2(0x00u, rt, rd)
++#define CFC2(rt, rd)   cop2(0x02u, rt, rd)
++#define MTC2(rt, rd)   cop2(0x04u, rt, rd)
++#define LW(rt, off, b) i_type(0x23u, b, rt, (uint16_t)(off))
++#define LWR(rt, off, b) i_type(0x26u, b, rt, (uint16_t)(off))
++#define ADDIU(rt, rs, v) i_type(0x09u, rs, rt, (uint16_t)(v))
++#define MOVE(rd, rs)   r_type(rs, ZERO, rd, 0x21u)    /* addu rd, rs, zero */
++#define BGTZ(rs, off)  i_type(0x07u, rs, 0, (uint16_t)(off))
++#define BEQ(rs, rt, off) i_type(0x04u, rs, rt, (uint16_t)(off))
++#define JAL(t)         ((0x03u << 26) | (((t) >> 2) & 0x03FFFFFFu))
++#define JR(rs)         r_type(rs, 0, 0, 0x08u)
++#define SYSCALL        0x0000000Cu
++
++static void put_word(uint32_t addr, uint32_t v) { memcpy(test_ram + (addr & 0x1FFFFFu), &v, 4); }
++static void put_code(uint32_t addr, const uint32_t *w, int n) {
++    for (int i = 0; i < n; i++) put_word(addr + 4u * (uint32_t)i, w[i]);
++}
++
++/* Steps the interpreter from `pc` like dirty_ram_dispatch's loop until pc ==
++ * stop or `max` instructions; returns the final pc. */
++static uint32_t run(CPUState *cpu, uint32_t pc, uint32_t stop, int max) {
++    for (int i = 0; i < max && pc != stop; i++) {
++        uint32_t next = 0;
++        cpu->pc = pc;
++        int transfer = exec_one(cpu, pc, &next);
++        pc = transfer ? cpu->pc : next;
++    }
++    return pc;
++}
++
++static void reset(CPUState *cpu) {
++    memset(cpu, 0, sizeof *cpu);
++    memset(gte_data, 0, sizeof gte_data);
++    memset(gte_ctrl, 0, sizeof gte_ctrl);
++    mtc2_n = 0; call_n = 0; syscall_n = 0;
++    dirty_ram_ld_delay_discard();
++}
++
++/* Tekken 2's vertex loop: t8 walks three packed XY words, SZ1 holds a depth. */
++static void test_vertex_loop(void) {
++    CPUState cpu; reset(&cpu);
++    const uint32_t L = CODE;
++    const uint32_t code[] = {
++        MTC2(T0, VXY0),        /* L+0  sees the OLD t0                   */
++        LW(T0, 0, T8),         /* L+4                                    */
++        ADDIU(T8, T8, 4),      /* L+8  (the lw's delay slot)             */
++        ADDIU(T9, T9, -1),     /* L+12                                   */
++        BGTZ(T9, -5),          /* L+16 -> L                              */
++        MFC2(T0, SZ1),         /* L+20 delay slot                        */
++        MOVE(T1, T0),          /* L+24 fall-through: mfc2's delay slot   */
++        MOVE(T2, T0),          /* L+28 sees SZ1                          */
++        NOP,
++    };
++    put_code(L, code, 9);
++    put_word(DATA + 0, 0x00100010u);
++    put_word(DATA + 4, 0x00200020u);
++    put_word(DATA + 8, 0x00300030u);
++    gte_data[SZ1] = 18645u;               /* the depth from the bisect */
++    cpu.gpr[T0] = 0x00080008u;
++    cpu.gpr[T8] = DATA;
++    cpu.gpr[T9] = 3;
++    uint32_t end = run(&cpu, L, L + 32, 64);
++    CHECK(end == L + 32, "loop ended at 0x%08X", end);
++    CHECK(mtc2_n == 3, "%d MTC2 writes, want 3", mtc2_n);
++    const uint32_t want[3] = { 0x00080008u, 0x00100010u, 0x00200020u };
++    for (int i = 0; i < 3 && i < mtc2_n; i++)
++        CHECK(mtc2_log[i] == want[i],
++              "iteration %d: VXY0 = 0x%08X, want 0x%08X (SZ1 is %u)", i,
++              mtc2_log[i], want[i], gte_data[SZ1]);
++    CHECK(cpu.gpr[T1] == 0x00300030u,
++          "fall-through delay slot saw t0 = 0x%08X, want the lw value 0x00300030",
++          cpu.gpr[T1]);
++    CHECK(cpu.gpr[T2] == 18645u, "after the delay slot t0 = %u, want SZ1",
++          cpu.gpr[T2]);
++    CHECK(cpu.gpr[T0] == 18645u, "t0 = %u, want SZ1", cpu.gpr[T0]);
++}
++
++/* In-block pairs in game RAM: the next instruction sees the old value, the one
++ * after sees the new value. */
++static void check_pair(const char *what, uint32_t load) {
++    CPUState cpu; reset(&cpu);
++    const uint32_t code[] = { load, MOVE(T1, T0), MOVE(T2, T0), NOP };
++    put_code(CODE, code, 4);
++    put_word(DATA, 0x12345678u);
++    gte_data[SZ1] = 0x12345678u;
++    gte_ctrl[CTRL_H] = 0x12345678u;
++    cpu.gpr[T0] = 0xAAAA5555u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 12, 8);
++    CHECK(cpu.gpr[T1] == 0xAAAA5555u, "%s: delay slot saw 0x%08X, want the old value",
++          what, cpu.gpr[T1]);
++    CHECK(cpu.gpr[T2] == 0x12345678u, "%s: next saw 0x%08X, want the loaded value",
++          what, cpu.gpr[T2]);
++}
++
++static void test_pairs(void) {
++    check_pair("mfc2", MFC2(T0, SZ1));
++    check_pair("cfc2", CFC2(T0, CTRL_H));
++    check_pair("lw", LW(T0, 0, T8));
++}
++
++/* lw t0; beq t0,zero,+2; move t1,t0: the branch reads the old t0 (0, taken),
++ * its own delay slot the loaded one. */
++static void test_branch_in_slot(void) {
++    CPUState cpu; reset(&cpu);
++    const uint32_t code[] = { LW(T0, 0, T8), BEQ(T0, ZERO, 2), MOVE(T1, T0),
++                              ADDIU(T3, ZERO, 1), NOP, NOP };
++    put_code(CODE, code, 6);
++    put_word(DATA, 7u);
++    cpu.gpr[T8] = DATA;
++    uint32_t end = run(&cpu, CODE, CODE + 16, 8);
++    CHECK(end == CODE + 16, "beq on the old t0 (0) should be taken, ended 0x%08X", end);
++    CHECK(cpu.gpr[T3] == 0u, "beq fell through");
++    CHECK(cpu.gpr[T1] == 7u, "branch delay slot saw t0 = %u, want 7", cpu.gpr[T1]);
++}
++
++/* The load wins a same-register ALU write in its delay slot; LWL/LWR forward. */
++static void test_conflicts(void) {
++    CPUState cpu; reset(&cpu);
++    const uint32_t code[] = { LW(T0, 0, T8), ADDIU(T0, ZERO, 5), MOVE(T1, T0), NOP };
++    put_code(CODE, code, 4);
++    put_word(DATA, 0x1000u);
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 12, 8);
++    CHECK(cpu.gpr[T1] == 0x1000u && cpu.gpr[T0] == 0x1000u,
++          "load vs addiu in its slot: t0 = 0x%X, want the load (0x1000)", cpu.gpr[T0]);
++
++    /* lw t0 then lwr t0 at a partial offset: the merge base must be the lw's
++     * value (forwarded), not the old t0. */
++    reset(&cpu);
++    const uint32_t lwlr2[] = { LW(T0, 0, T8), LWR(T0, 5, T8), NOP };
++    put_code(CODE, lwlr2, 3);
++    put_word(DATA, 0x11223344u);
++    put_word(DATA + 4, 0xAABBCCDDu);
++    cpu.gpr[T0] = 0x99999999u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 8, 4);
++    CHECK(cpu.gpr[T0] == 0x11AABBCCu,
++          "lwr after lw merged into 0x%08X, want 0x11AABBCC (forwarded base)",
++          cpu.gpr[T0]);
++}
++
++/* jal f; lw a0 in the slot. Interpreted callee: its first instruction sees the
++ * old a0, its second the loaded one. Compiled callee: the call returns inline
++ * and the return site must not be shown the old a0. */
++static void test_calls(void) {
++    CPUState cpu; reset(&cpu);
++    const uint32_t F = CODE + 0x100u;
++    const uint32_t caller[] = { JAL(F), LW(A0, 0, T8), MOVE(T3, A0), NOP };
++    const uint32_t callee[] = { MOVE(T1, A0), MOVE(T2, A0), JR(31), NOP };
++    put_code(CODE, caller, 4);
++    put_code(F, callee, 4);
++    put_word(DATA, 0x4444u);
++    cpu.gpr[A0] = 0x1111u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 12, 16);
++    CHECK(cpu.gpr[T1] == 0x1111u, "interpreted callee's first instruction saw a0 = 0x%X, want 0x1111",
++          cpu.gpr[T1]);
++    CHECK(cpu.gpr[T2] == 0x4444u, "callee's second instruction saw a0 = 0x%X", cpu.gpr[T2]);
++    CHECK(cpu.gpr[T3] == 0x4444u, "return site saw a0 = 0x%X", cpu.gpr[T3]);
++
++    reset(&cpu);
++    const uint32_t caller2[] = { JAL(NONLOCAL_FN), LW(A0, 0, T8), MOVE(T3, A0), NOP };
++    put_code(CODE, caller2, 4);
++    cpu.gpr[A0] = 0x1111u;
++    cpu.gpr[T8] = DATA;
++    uint32_t end = run(&cpu, CODE, CODE + 12, 8);
++    CHECK(call_n == 1 && call_target == NONLOCAL_FN, "compiled callee not called (%d)", call_n);
++    CHECK(call_a0 == 0x4444u, "compiled callee entered with a0 = 0x%X, want the loaded value",
++          call_a0);
++    CHECK(end == CODE + 12 && cpu.gpr[T3] == 0x4444u,
++          "return site saw a0 = 0x%X (stale delay-slot value?)", cpu.gpr[T3]);
++}
++
++/* SYSCALL in a load's delay slot: the exception drains the pipeline. */
++static void test_syscall_in_slot(void) {
++    CPUState cpu; reset(&cpu);
++    const uint32_t code[] = { LW(A0, 0, T8), SYSCALL, NOP };
++    put_code(CODE, code, 3);
++    put_word(DATA, 0x5555u);
++    cpu.gpr[A0] = 0x1u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 8, 2);
++    CHECK(syscall_n == 1 && syscall_a0 == 0x5555u,
++          "syscall in the delay slot saw a0 = 0x%X, want 0x5555", syscall_a0);
++}
++
++/* A register changed by something else (compiled code, a handler) before the
++ * slot runs: no stale value is put back. Flush and discard end the window. */
++static void test_stale_and_flush(void) {
++    CPUState cpu; reset(&cpu);
++    const uint32_t code[] = { LW(T0, 0, T8), MOVE(T1, T0), NOP };
++    put_code(CODE, code, 3);
++    put_word(DATA, 0x2222u);
++    cpu.gpr[T0] = 0x1u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 4, 1);
++    CHECK(cpu.gpr[T0] == 0x2222u, "the load's register is written at once (0x%X)", cpu.gpr[T0]);
++    cpu.gpr[T0] = 0x3333u;                      /* changed behind our back */
++    run(&cpu, CODE + 4, CODE + 8, 1);
++    CHECK(cpu.gpr[T1] == 0x3333u && cpu.gpr[T0] == 0x3333u,
++          "stale window: t1 = 0x%X t0 = 0x%X, want 0x3333", cpu.gpr[T1], cpu.gpr[T0]);
++
++    reset(&cpu);
++    cpu.gpr[T0] = 0x1u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 4, 1);
++    dirty_ram_ld_delay_flush(&cpu);             /* hand-off to compiled code */
++    run(&cpu, CODE + 4, CODE + 8, 1);
++    CHECK(cpu.gpr[T1] == 0x2222u, "after flush the slot saw 0x%X", cpu.gpr[T1]);
++
++    reset(&cpu);
++    cpu.gpr[T0] = 0x1u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 4, 1);
++    dirty_ram_ld_delay_discard();               /* savestate restore */
++    run(&cpu, CODE + 4, CODE + 8, 1);
++    CHECK(cpu.gpr[T1] == 0x2222u, "after discard the slot saw 0x%X", cpu.gpr[T1]);
++
++    /* Entering at a different PC than the delay slot: no window. */
++    reset(&cpu);
++    const uint32_t code2[] = { LW(T0, 0, T8), NOP, MOVE(T1, T0), NOP };
++    put_code(CODE, code2, 4);
++    cpu.gpr[T0] = 0x1u;
++    cpu.gpr[T8] = DATA;
++    run(&cpu, CODE, CODE + 4, 1);
++    run(&cpu, CODE + 8, CODE + 12, 1);
++    CHECK(cpu.gpr[T1] == 0x2222u, "a jump past the slot saw 0x%X", cpu.gpr[T1]);
++}
++
++int main(void) {
++    test_vertex_loop();
++    test_pairs();
++    test_branch_in_slot();
++    test_conflicts();
++    test_calls();
++    test_syscall_in_slot();
++    test_stale_and_flush();
++    if (failures) {
++        fprintf(stderr, "%d check(s) failed\n", failures);
++        return 1;
++    }
++    puts("PASS interpreter load delay: MFC2/CFC2/LW in game RAM, branch delay "
++         "slots into targets and fall-through, calls, conflicts, flush");
++    return 0;
++}

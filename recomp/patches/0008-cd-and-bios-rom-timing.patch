@@ -1,0 +1,1024 @@
+diff --git a/runtime/include/cd_timing.h b/runtime/include/cd_timing.h
+new file mode 100644
+index 00000000..b33048b4
+--- /dev/null
++++ b/runtime/include/cd_timing.h
+@@ -0,0 +1,66 @@
++#ifndef PSXRECOMP_CD_TIMING_H
++#define PSXRECOMP_CD_TIMING_H
++
++/* CD drive timing model (Tekken 2 patch 0008). See cd_timing.c.
++ *
++ * When enabled, cdrom.c takes its latencies from here: a command executes
++ * (and its first response is raised) one controller turn after the guest
++ * writes it, seeks take time by distance and position on the disc, the first
++ * sector of a read waits for the seek, Pause waits for the end of the
++ * revolution, a speed change spins the disc up or down, and Init seeks home.
++ * Disabled, cdrom.c keeps psxrecomp's own constants.
++ *
++ * On by default in the REFERENCE execution profile, off in ENHANCED.
++ * PSX_CD_TIMING=1 or =0 overrides either default. */
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* PSX-SPX cdromdrive, "INT1 Rate": 75 sectors a second at single speed. */
++#define CD_TIMING_SECTOR_1X        451584u
++/* Two sectors: a logical seek ends this far before its target (the sector
++ * header it stops on), so a following read reads forward into it. */
++#define CD_TIMING_HOLD_SKEW        2
++
++int  cd_timing_enabled(void);
++void cd_timing_set_enabled(int on);       /* tests and tools; -1 = default */
++
++uint32_t cd_timing_sector_cycles(int double_speed);
++/* Command write to first response (and to the command taking effect). */
++uint32_t cd_timing_ack_cycles(uint8_t cmd);
++/* Sectors on one revolution at `lba` (track-relative, 0 = 00:02:00). */
++int      cd_timing_sectors_per_track(int lba);
++/* From the head at `from` to the head at `to`, no speed change running. */
++uint32_t cd_timing_seek_cycles(int from, int to, int double_speed);
++/* Pause command to its second response. `since_last_sector` only counts
++ * while reading. */
++uint32_t cd_timing_pause_cycles(int reading, int double_speed, int lba,
++                                uint32_t since_last_sector);
++uint32_t cd_timing_speed_change_cycles(int to_double_speed);
++/* Init's second response: the speed change back to single speed plus the
++ * seek home, at least INIT_MIN. */
++uint32_t cd_timing_init_cycles(uint32_t speed_change, uint32_t seek);
++uint32_t cd_timing_getid_cycles(void);
++
++/* Where the head is. While reading it follows the sectors; otherwise it
++ * holds near `lba` (+ `skew`) by jumping back one track per revolution. */
++typedef struct {
++    int      lba;          /* data position: last sector read or seek target */
++    int      subq;         /* head position */
++    int      skew;         /* CD_TIMING_HOLD_SKEW once a sector header is valid */
++    uint64_t since;        /* guest cycle `subq` was last set */
++    uint32_t carry;        /* cycles into the current sector */
++} CdTimingHead;
++
++void cd_timing_head_set(CdTimingHead *h, int lba, int subq, int skew, uint64_t now);
++/* The head position at `now` while holding (not reading), advancing `h`. */
++int  cd_timing_head_hold(CdTimingHead *h, uint64_t now, int double_speed);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/runtime/include/rom_timing.h b/runtime/include/rom_timing.h
+new file mode 100644
+index 00000000..bd5c72c5
+--- /dev/null
++++ b/runtime/include/rom_timing.h
+@@ -0,0 +1,92 @@
++#ifndef PSXRECOMP_ROM_TIMING_H
++#define PSXRECOMP_ROM_TIMING_H
++
++/* BIOS ROM access time (Tekken 2 patch 0008).
++ *
++ * The BIOS ROM sits on an 8-bit bus (PSX-SPX memorycontrol, "1F801010h -
++ * BIOS ROM Delay/Size (usually 0013243Fh) (512Kbytes, 8bit-bus)"), so every
++ * byte, halfword and word the CPU reads from it, instructions included (the
++ * BIOS's own boot code runs from ROM, uncached), takes several bus cycles.
++ * The time follows the delay/size register and the common delay register
++ * (1F801020h, COM_DELAY): the access time field, the COM0/COM2/COM3 terms it
++ * selects and the bus width give the first and each following byte's cycles
++ * (the nocash formula PSX-SPX's memorycontrol section is drawn from, as
++ * DuckStation ffb33c28 implements it in Bus::CalculateMemoryTiming; read for
++ * behaviour only). With the BIOS's boot values 0013243Fh / 00031125h a word
++ * takes 24 cycles, a halfword 12, a byte 6; OpenBIOS's CD code later writes
++ * COM_DELAY = 0000132Ch, and a word then takes 32.
++ *
++ * Measured on DuckStation ffb33c28: a load from ROM 25.4 cycles a word
++ * against 7.4 from RAM with 00031125h (tools/cd_timing/rom_probe.py), and
++ * OpenBIOS's 50,000-pass delay loop in initCDRom (three instructions fetched
++ * from ROM) 99 cycles a pass with 0000132Ch, 33 an instruction
++ * (measured with Tekken 2's boot). psxrecomp
++ * charged a ROM word less than a RAM word, which let OpenBIOS reach its
++ * first CD command 18.5 million cycles (33 VBlanks) before DuckStation; a
++ * fixed 18 cycles over RAM (the first version of this patch) still ran the
++ * delay loop 1.5 million cycles short and every ROM byte load 15 long.
++ *
++ * Charged here: an uncached instruction fetch from ROM takes the word time
++ * (instead of the 4 of an uncached RAM fetch), and a load from ROM takes the
++ * time of its width, the whole of it a stall (psx_cyc_readmem: no Beetle
++ * completion, fudge or give-back), so a ROM instruction costs what it does
++ * on DuckStation: 1 + 24 cycles, and a byte load 1 + 6, at the boot values.
++ * OpenBIOS's byte-wise memcpy of its shell from ROM (81,220 bytes) took 2
++ * cycles a byte too long with the load's fudge.
++ *
++ * On by default in the REFERENCE execution profile, off in ENHANCED;
++ * PSX_ROM_TIMING=1 or =0 overrides either default. */
++
++#include "execution_profile.h"
++
++#include <stdint.h>
++#include <stdlib.h>
++
++/* Power-on and boot values of 1F801010h and 1F801020h (PSX-SPX). */
++#define PSX_ROM_BIOS_DELAY_DEFAULT 0x0013243Fu
++#define PSX_ROM_COM_DELAY_DEFAULT  0x00031125u
++
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define PSX_ROM_TIMING_DEFAULT 1
++#else
++#define PSX_ROM_TIMING_DEFAULT 0
++#endif
++
++static inline int psx_rom_timing_enabled(void) {
++    static int s_on = -1;
++    if (s_on < 0) {
++        const char *e = getenv("PSX_ROM_TIMING");
++        s_on = (e && (e[0] == '0' || e[0] == '1')) ? (e[0] == '1') : PSX_ROM_TIMING_DEFAULT;
++    }
++    return s_on;
++}
++
++/* Byte, halfword and word read times in CPU cycles for a device whose
++ * delay/size register is `delay`, given COM_DELAY `com`. */
++static inline void psx_mem_access_times(uint32_t delay, uint32_t com, uint32_t out[3]) {
++    const int access = (int)((delay >> 4) & 0xFu);
++    const int bus16 = (int)((delay >> 12) & 1u);
++    const int com0 = (int)(com & 0xFu), com2 = (int)((com >> 8) & 0xFu), com3 = (int)((com >> 12) & 0xFu);
++    int first = 0, seq = 0, min = 0;
++    if (delay & (1u << 8))  { first += com0 - 1; seq += com0 - 1; }
++    if (delay & (1u << 10)) { first += com2;     seq += com2; }
++    if (delay & (1u << 11)) min = com3;
++    if (first < 6) first++;
++    first += access + 2;
++    seq += access + 2;
++    if (first < min + 6) first = min + 6;
++    if (seq < min + 2) seq = min + 2;
++    const int t[3] = { first, bus16 ? first : first + seq, bus16 ? first + seq : first + 3 * seq };
++    for (int i = 0; i < 3; i++) out[i] = t[i] > 1 ? (uint32_t)(t[i] - 1) : 0u;
++}
++
++/* Current BIOS ROM byte/halfword/word times (memory.c keeps them in step
++ * with writes to 1F801010h and 1F801020h). */
++extern uint32_t g_psx_rom_access[3];
++
++static inline int psx_is_bios_rom(uint32_t addr) {
++    uint32_t phys = addr & 0x1FFFFFFFu;
++    return phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu;
++}
++
++#endif
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index d776a8c8..bb4bf372 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -494,6 +494,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/cue_sheet.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/disc_path.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/cdrom.c
++    ${PSXRECOMP_ROOT}/runtime/src/cd_timing.c
+     ${PSXRECOMP_ROOT}/runtime/src/spu.c
+     ${PSXRECOMP_ROOT}/runtime/src/spu_shadow.c
+     ${PSXRECOMP_ROOT}/runtime/src/audio_shadow.c
+@@ -632,6 +633,21 @@ else()
+     endif()
+ endif()
+ 
++# CD drive timing model (Tekken 2 patch 0008): measured seek, read, Pause,
++# speed-change and Init times. Registered once, in whichever
++# project includes this file (a game's build or the runtime's own).
++if(BUILD_TESTING AND NOT TARGET cd_timing_test)
++    add_executable(cd_timing_test
++        ${PSXRECOMP_ROOT}/runtime/tests/test_cd_timing.c
++        ${PSXRECOMP_ROOT}/runtime/src/cd_timing.c)
++    target_include_directories(cd_timing_test PRIVATE ${PSXRECOMP_ROOT}/runtime/include)
++    if(NOT WIN32)
++        target_link_libraries(cd_timing_test PRIVATE m)
++    endif()
++    add_test(NAME cd_timing_test COMMAND cd_timing_test)
++    set_tests_properties(cd_timing_test PROPERTIES ENVIRONMENT "PSX_CD_TIMING=")
++endif()
++
+ # Portable rollback host policy (sched/hist/hash_confirm/snap). Sits next to
+ # recomp-net; MotK keeps thin PSX glue (pad↔frame, boot_state, FMV/dig0 gates).
+ # Snap ring is also used for local rewind without linking full rbengine/recomp-net.
+diff --git a/runtime/src/cd_timing.c b/runtime/src/cd_timing.c
+new file mode 100644
+index 00000000..ef99880c
+--- /dev/null
++++ b/runtime/src/cd_timing.c
+@@ -0,0 +1,179 @@
++/* CD drive timing model (Tekken 2 patch 0008).
++ *
++ * Why: before this, psxrecomp's CD answered every command 5000 cycles after
++ * the write, completed seeks in 10,267 cycles, started reads a fixed one or
++ * two sector periods after ReadN and did not model the speed change, so a
++ * faithful (REFERENCE) Tekken 2 run reached the intro 168 VBlanks before
++ * DuckStation and every load 40 to 55 VBlanks early.
++ *
++ * Sources. Structure from documented drive behaviour, PSX-SPX cdromdrive:
++ *  - "CDROM - Response Timings": the first response comes after the
++ *    controller's main loop sees the command; Init does some initialisation
++ *    before its first response. Second responses of Seek/Read/Init depend on
++ *    the seek time and, for Pause, are "about 5 sectors" long.
++ *  - "INT1 Rate": SystemClock*930h/4/44100Hz per sector at single speed,
++ *    half that at double speed (451,584 and 225,792 cycles).
++ *  - Seek timings are "still unknown, and they are probably quite
++ *    complicated": coarse and fine steps, and "the amount of data per spiral
++ *    winding increases towards ends of the disc".
++ *  - "Pause ... during some phases of a seek": rejected with INT5.
++ *  - "Init: Multiple effects at once. Sets mode=20h".
++ * Constants: PSX-SPX gives no seek, speed-change or Init times, so every
++ * number below was measured (psxrecomp PROVENANCE.md rule 4, "When
++ * documentation is silent, measure"): recomp/tools/cd_timing/
++ * probe.py builds a PS-X EXE that times 2,711 CD commands on DuckStation
++ * ffb33c28 with the Tekken 2 disc in the drive, fit.py derives the constants
++ * (constants.json) and model.py checks this arithmetic against every
++ * response (median error 4,400 cycles, the drive's own jitter). DuckStation's
++ * source was read for behaviour only; nothing was copied.
++ *
++ * Not modelled: spin-up from a stopped motor, Stop, Play/CD-DA seeks, the
++ * per-seek jitter (a mean is used), XA/CD-DA streaming beyond the sector
++ * rate. */
++
++#include "cd_timing.h"
++#include "execution_profile.h"
++
++#include <math.h>
++#include <stdlib.h>
++
++/* ---- enable ---- */
++
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define CD_TIMING_DEFAULT 1
++#else
++#define CD_TIMING_DEFAULT 0
++#endif
++
++static int s_enabled = -1;
++
++int cd_timing_enabled(void) {
++    if (s_enabled < 0) {
++        const char *e = getenv("PSX_CD_TIMING");
++        if (e && (e[0] == '0' || e[0] == '1'))
++            s_enabled = e[0] == '1';
++        else
++            s_enabled = CD_TIMING_DEFAULT;
++    }
++    return s_enabled;
++}
++
++void cd_timing_set_enabled(int on) { s_enabled = on < 0 ? -1 : (on != 0); }
++
++/* ---- measured constants (tools/cd_timing/constants.json) ---- */
++
++#define ACK_CYCLES          25000u     /* 2,546 first responses, 25,024..25,040 */
++#define ACK_INIT_CYCLES     80000u
++#define SEEK_SETTLE         25137u     /* mean extra time of a seek, 17,024..33,704 */
++#define SHORT_JUMP          1693402u   /* about 0.05 s */
++#define LONG_JUMP           3387176u   /* about 0.1 s */
++#define NEAR_LIMIT          7200       /* sectors; beyond, the sled moves */
++#define SWITCH_A            330.98     /* short/long switch: A + B ln(minute) */
++#define SWITCH_B            (-64.478)
++#define SLED_A              1685351.0  /* sled: A + B ln(d) + C d */
++#define SLED_B              908355.2
++#define SLED_C              53.3106
++#define PAUSE_IDLE_CYCLES   27000u
++#define GETID_CYCLES        33900u
++#define INIT_MIN_CYCLES     4000000u
++#define SPEED_UP_CYCLES     20310000u  /* 0.600 s */
++#define SPEED_DOWN_CYCLES   23710000u  /* 0.700 s */
++/* PSX-SPX "Second Response" minimums for Pause (single, double speed). */
++#define PAUSE_MIN_1X        0x020EAEFu
++#define PAUSE_MIN_2X        0x010477Au
++
++/* Sectors per revolution by disc minute (MSF, the 2 s pregap included),
++ * from Pause after a sector at double speed: (n - 2) sector periods. */
++static const uint8_t k_spt_by_minute[] = {
++     8,  9,  9,  9,  9, 10, 10, 10, 11, 11, 11, 11, 12, 12, 12, 12, 12, 13,
++    13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 15, 16, 16, 16,
++    16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 19,
++    19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20,
++};
++
++uint32_t cd_timing_sector_cycles(int double_speed) {
++    return double_speed ? CD_TIMING_SECTOR_1X / 2u : CD_TIMING_SECTOR_1X;
++}
++
++uint32_t cd_timing_ack_cycles(uint8_t cmd) {
++    return cmd == 0x0A ? ACK_INIT_CYCLES : ACK_CYCLES;
++}
++
++int cd_timing_sectors_per_track(int lba) {
++    int m = (lba + 150) / 4500;
++    int n = (int)(sizeof(k_spt_by_minute) / sizeof(k_spt_by_minute[0]));
++    if (m < 0) m = 0;
++    if (m >= n) m = n - 1;
++    return k_spt_by_minute[m];
++}
++
++static double switch_distance(int lba) {
++    double m = (lba + 150) / 4500.0;
++    if (m < 1.0) m = 1.0;
++    if (m > 72.0) m = 72.0;
++    return SWITCH_A + SWITCH_B * log(m);
++}
++
++uint32_t cd_timing_seek_cycles(int from, int to, int double_speed) {
++    uint32_t p = cd_timing_sector_cycles(double_speed);
++    int diff = to > from ? to - from : from - to;
++    int spt = cd_timing_sectors_per_track(from);
++    int back = from >= spt ? from - spt : 0;
++    double t;
++    if (from < to && diff <= spt)            /* ahead on this track: read to it */
++        t = (double)p * (diff < 2 ? 2 : diff);
++    else if (from >= to && back <= to)       /* one track jump back, then read */
++        t = (double)p * (to - back < 1 ? 1 : to - back);
++    else if (diff < NEAR_LIMIT)
++        t = diff < switch_distance(from) ? SHORT_JUMP : LONG_JUMP;
++    else
++        t = SLED_A + SLED_B * log((double)diff) + SLED_C * diff;
++    return (uint32_t)t + SEEK_SETTLE;
++}
++
++uint32_t cd_timing_pause_cycles(int reading, int double_speed, int lba,
++                                uint32_t since_last_sector) {
++    if (!reading) return PAUSE_IDLE_CYCLES;
++    int64_t t = (int64_t)(cd_timing_sectors_per_track(lba) - 2) *
++                cd_timing_sector_cycles(double_speed) - since_last_sector;
++    int64_t lo = double_speed ? PAUSE_MIN_2X : PAUSE_MIN_1X;
++    return (uint32_t)(t < lo ? lo : t);
++}
++
++uint32_t cd_timing_speed_change_cycles(int to_double_speed) {
++    return to_double_speed ? SPEED_UP_CYCLES : SPEED_DOWN_CYCLES;
++}
++
++uint32_t cd_timing_init_cycles(uint32_t speed_change, uint32_t seek) {
++    uint64_t t = (uint64_t)speed_change + seek;
++    return t < INIT_MIN_CYCLES ? INIT_MIN_CYCLES : (uint32_t)t;
++}
++
++uint32_t cd_timing_getid_cycles(void) { return GETID_CYCLES; }
++
++/* ---- head position ---- */
++
++void cd_timing_head_set(CdTimingHead *h, int lba, int subq, int skew, uint64_t now) {
++    h->lba = lba;
++    h->subq = subq;
++    h->skew = skew;
++    h->since = now;
++    h->carry = 0;
++}
++
++int cd_timing_head_hold(CdTimingHead *h, uint64_t now, int double_speed) {
++    uint32_t p = cd_timing_sector_cycles(double_speed);
++    if (now <= h->since) return h->subq;
++    uint64_t total = (now - h->since) + h->carry;
++    uint64_t n = total / p;
++    if (n == 0) return h->subq;
++    int anchor = h->lba + h->skew;
++    int spt = cd_timing_sectors_per_track(anchor);
++    int back = anchor >= spt ? anchor - spt : 0;
++    int64_t off = ((int64_t)h->subq - back + (int64_t)(n % (uint64_t)spt)) % spt;
++    if (off < 0) off += spt;
++    h->subq = back + (int)off;
++    h->since = now;
++    h->carry = (uint32_t)(total % p);
++    return h->subq;
++}
+diff --git a/runtime/src/cdrom.c b/runtime/src/cdrom.c
+index 2250ed0d..dcee257a 100644
+--- a/runtime/src/cdrom.c
++++ b/runtime/src/cdrom.c
+@@ -13,6 +13,7 @@
+ #include "cdrom.h"
+ #include "cdrom_irq.h"
+ #include "cdrom_lid.h"
++#include "cd_timing.h"
+ #include "dma.h"
+ #include "spu.h"
+ #include "event_ring.h"
+@@ -940,7 +941,49 @@ static void response_push(uint8_t val) {
+     }
+ }
+ 
++
++/* CD event log for the differential test (recomp/tools/diff):
++ * off unless T2DIFF_CDLOG names a file. One line per event, the same format
++ * the patched DuckStation writes: "C frame cycle cmd n params" when the guest
++ * writes a command, "S frame cycle type lba" when a response is latched,
++ * "I frame cycle type lba" when it is raised to the interrupt controller,
++ * "A frame cycle bits" when the guest acknowledges it. */
++static FILE *cd_event_log(void) {
++    static int state;
++    static FILE *f;
++    if (!state) {
++        const char *path = getenv("T2DIFF_CDLOG");
++        state = 1;
++        if (path && *path) f = fopen(path, "w");
++    }
++    return f;
++}
++
++/* ---- CD drive timing (Tekken 2 patch 0008, cd_timing.c) ----
++ * Only while cd_timing_enabled(): REFERENCE builds, or PSX_CD_TIMING=1. */
++static CdTimingHead s_cdt_head;        /* where the drive head is */
++static uint64_t s_cdt_speed_due;       /* a speed change finishes */
++static uint64_t s_cdt_cmd_written;     /* the queued command was written */
++static uint64_t s_cdt_cmd_due;         /* ... and executes */
++static int      s_cdt_read_seeking;    /* a read has not reached its first sector */
++static int      s_cdt_in_store;        /* inside the guest's CD register store */
++
++static int cdt_double(void) { return (mode_reg & 0x80) != 0; }
++
++static uint32_t cdt_speed_wait(void) {
++    return s_cdt_speed_due > psx_cycle_count
++        ? (uint32_t)(s_cdt_speed_due - psx_cycle_count) : 0u;
++}
++
++static int cdt_head_position(void) {
++    if (reading && !s_cdt_read_seeking) return s_cdt_head.subq;
++    return cd_timing_head_hold(&s_cdt_head, psx_cycle_count, cdt_double());
++}
++
+ static void set_irq(int type) {
++    if (cd_event_log())
++        fprintf(cd_event_log(), "S %u %llu %d %d\n", (unsigned)s_frame_count,
++                (unsigned long long)psx_cycle_count, type, (int)last_sector_lba);
+     irq_flag = (uint8_t)type;
+     /* New visible CD INT generation: it has not yet been presented to INTC,
+      * so re-arm the latch (the delayed present below raises it once). */
+@@ -950,7 +993,11 @@ static void set_irq(int type) {
+      * synchronously inside the guest store that triggered it (see the
+      * CDROM_IRQ_PRESENT_DELAY note). Absolute due — not a slice-relative
+      * countdown (see pending.due_cyc). */
+-    cdrom_irq_present_due = psx_cycle_count + (uint64_t)CDROM_IRQ_PRESENT_DELAY;
++    /* With the timing model a response comes from a scheduled drive event,
++     * as on the hardware, and is raised at once; only one made inside the
++     * guest's own register store keeps the presentation delay. */
++    cdrom_irq_present_due = psx_cycle_count +
++        ((cd_timing_enabled() && !s_cdt_in_store) ? 0u : (uint64_t)CDROM_IRQ_PRESENT_DELAY);
+     trace_cdrom('I', 0, (uint32_t)type, 0);
+     /* DEQUEUE: CD response/data event fired (aux = CD irq type). */
+     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
+@@ -1007,6 +1054,9 @@ static void present_cdrom_irq(void) {
+     if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag) &&
+         !cdrom_intc_request_latched) {
+         psx_irq_raise(2, irq_flag); /* IRQ_CDROM; detail = CD response/IRQ type */
++        if (cd_event_log())
++            fprintf(cd_event_log(), "I %u %llu %d %d\n", (unsigned)s_frame_count,
++                    (unsigned long long)psx_cycle_count, (int)irq_flag, (int)last_sector_lba);
+         cdrom_intc_request_latched = 1;
+         cdrom_intc_latched_generation = cdrom_irq_generation;
+         event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);
+@@ -1654,6 +1704,16 @@ static void read_seek_landed(void) {
+ }
+ 
+ static void start_read_stream(uint8_t cmd) {
++    /* Timing model: the first sector comes once the head has reached the
++     * target (any speed change first) and read it. */
++    int cdt_first = 0;
++    if (cd_timing_enabled()) {
++        int target = setloc_pending ? s_setloc_lba : msf_to_lba(read_min, read_sec, read_sect);
++        int pos = cdt_head_position();
++        cdt_first = (int)(cdt_speed_wait() + cd_timing_seek_cycles(pos, target, cdt_double()) +
++                          cd_timing_sector_cycles(cdt_double()));
++        s_cdt_read_seeking = 1;
++    }
+     cdda_playing = 0;
+     cdda_track = 0;
+     cdda_delay = 0;
+@@ -1679,7 +1739,7 @@ static void start_read_stream(uint8_t cmd) {
+     }
+     setloc_pending = 0;
+     read_cmd = cmd;
+-    read_delay = initial_read_delay_cycles();
++    read_delay = cd_timing_enabled() ? apply_read_speed(cdt_first) : initial_read_delay_cycles();
+     s_cd_probe_read_start_count++;
+     s_cd_probe_read_start_cycles += (uint64_t)read_delay;
+     s_cd_timing_next_due = psx_cycle_count + (uint64_t)read_delay;
+@@ -2043,6 +2103,11 @@ static void cd_bisect_cmd_log(const char *kind, uint8_t cmd,
+ 
+ static void try_execute_queued_command(void) {
+     if (!queued_cmd.pending || irq_flag != 0) return;
++    /* Timing model: the controller takes the command one turn after the
++     * write (PSX-SPX "First Response"), and never inside the guest's store;
++     * the next device service runs it. */
++    if (cd_timing_enabled() &&
++        (psx_cycle_count < s_cdt_cmd_due || s_cdt_in_store)) return;
+ 
+     uint8_t cmd = queued_cmd.cmd;
+     int count = queued_cmd.param_count;
+@@ -2061,7 +2126,16 @@ static void try_execute_queued_command(void) {
+ }
+ 
+ static void queue_or_exec_command(uint8_t cmd) {
+-    if (irq_flag == 0) {
++    if (cd_timing_enabled()) {
++        /* A command still waiting for the controller is replaced by the new
++         * one, which keeps the time already waited (BUSYSTS stays set). */
++        uint64_t start = queued_cmd.pending ? s_cdt_cmd_written : psx_cycle_count;
++        uint64_t due = start + cd_timing_ack_cycles(cmd);
++        if (due <= psx_cycle_count) due = psx_cycle_count + 1;
++        s_cdt_cmd_written = start;
++        s_cdt_cmd_due = due;
++        psx_next_service_cycle = 0;   /* re-plan the device deadline */
++    } else if (irq_flag == 0) {
+         exec_command(cmd);
+         return;
+     }
+@@ -2125,6 +2199,13 @@ static void exec_command(uint8_t cmd) {
+         if ((long)cmd == trap_cmd && ++trap_hits == trap_nth) raise(SIGSTOP);
+     }
+ #endif
++    /* Timing model: Init while an Init is still completing is dropped
++     * without a response (measured: OpenBIOS repeats Init while it waits,
++     * and only the first is answered). */
++    if (cd_timing_enabled() && cmd == 0x0A && pending.pending && pending.cmd == 0x0A) {
++        param_count = 0;
++        return;
++    }
+     trace_cdrom('C', 0, cmd, 0);
+     /* ENQUEUE: a CD command was issued (aux = command byte). */
+     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
+@@ -2264,7 +2345,23 @@ static void exec_command(uint8_t cmd) {
+         break;
+ 
+     case 0x09: { /* Pause */
++        if (cd_timing_enabled() && reading && s_cdt_read_seeking) {
++            /* PSX-SPX "Pause - Command 09h": during some phases of a seek,
++             * including a read's own, Pause fails with INT5(stat,80h); the
++             * read carries on. */
++            response_push(stat_reg | CDSTAT_ERROR);
++            response_push(0x80u);
++            set_irq(CDIRQ_ERROR);
++            break;
++        }
+         int complete_delay = pause_complete_delay_cycles();
++        if (cd_timing_enabled()) {
++            uint32_t period = cd_timing_sector_cycles(cdt_double());
++            uint32_t since = (reading && read_delay > 0 && (uint32_t)read_delay < period)
++                ? period - (uint32_t)read_delay : 0u;
++            complete_delay = (int)cd_timing_pause_cycles(
++                reading, cdt_double(), s_cdt_head.lba, since);
++        }
+         stop_read_stream();
+         stop_cdda_playback();
+         xa_reset_decode();
+@@ -2282,6 +2379,27 @@ static void exec_command(uint8_t cmd) {
+     }
+ 
+     case 0x0A: /* Init */
++        if (cd_timing_enabled()) {
++            /* Back to single speed (a spin-down if it was double), then a
++             * seek home; PSX-SPX "Init ... Sets mode=20h". */
++            int pos = cdt_head_position();
++            uint32_t speed = cdt_speed_wait() +
++                (cdt_double() ? cd_timing_speed_change_cycles(0) : 0u);
++            uint32_t seek = pos != 0 ? cd_timing_seek_cycles(pos, 0, 0) : 0u;
++            uint32_t total = cd_timing_init_cycles(speed, seek);
++            stop_read_stream();
++            stop_cdda_playback();
++            spu_cd_audio_reset();
++            xa_reset_decode();
++            mode_reg = 0x20;
++            s_cdt_speed_due = 0;
++            cd_timing_head_set(&s_cdt_head, 0, 0, 0, psx_cycle_count + total);
++            stat_reg = has_disc() ? CDSTAT_MOTOR : CDSTAT_SHELL;
++            response_push(stat_reg);
++            set_irq(CDIRQ_ACK);
++            pending_arm(0x0A, (int)total, 1);
++            break;
++        }
+         stop_read_stream();
+         stop_cdda_playback();
+         spu_cd_audio_reset();
+@@ -2328,6 +2446,11 @@ static void exec_command(uint8_t cmd) {
+ 
+     case 0x0E: /* SetMode */
+         if (param_count >= 1) {
++            if (cd_timing_enabled() && ((mode_reg ^ param_fifo[0]) & 0x80u)) {
++                cdt_head_position();   /* the head moves at the old speed until now */
++                s_cdt_speed_due = psx_cycle_count +
++                    cd_timing_speed_change_cycles((param_fifo[0] & 0x80u) != 0);
++            }
+             mode_reg = param_fifo[0];
+             if (!(mode_reg & 0x40u)) {
+                 xa_reset_decode();
+@@ -2509,6 +2632,15 @@ static void exec_command(uint8_t cmd) {
+         set_irq(CDIRQ_ACK);
+         {
+             int lat = seek_complete_delay_cycles();
++            if (cd_timing_enabled()) {
++                int target = msf_to_lba(seek_min, seek_sec, seek_sect);
++                int pos = cdt_head_position();
++                lat = apply_speed((int)(cdt_speed_wait() +
++                                        cd_timing_seek_cycles(pos, target, cdt_double())));
++                /* A logical seek stops on the header two sectors early. */
++                cd_timing_head_set(&s_cdt_head, target, target - CD_TIMING_HOLD_SKEW,
++                                   CD_TIMING_HOLD_SKEW, psx_cycle_count + (uint64_t)lat);
++            }
+             pending_arm(cmd, lat, 1); /* 0x15/0x16 — completed in process_pending */
+             s_cd_probe_seek_count++;
+             s_cd_probe_seek_cycles += (uint64_t)lat;
+@@ -2523,7 +2655,7 @@ static void exec_command(uint8_t cmd) {
+         set_irq(CDIRQ_ACK);
+         /* Beetle PS_CDC::Command_ID: second response after 33868 cycles.
+          * Unscaled — same authentic-latency class as Pause/Init/ReadTOC. */
+-        pending_arm(0x1A, 33868, 1);
++        pending_arm(0x1A, cd_timing_enabled() ? (int)cd_timing_getid_cycles() : 33868, 1);
+         break;
+ 
+     case 0x1B: /* ReadS */
+@@ -2639,6 +2771,8 @@ static void process_pending(uint32_t cycles) {
+         break;
+ 
+     case 0x0A: /* Init complete */
++        if (cd_timing_enabled())
++            queued_cmd.pending = 0;   /* a repeated Init still waiting is dropped */
+         response_push(stat_reg);
+         set_irq(CDIRQ_COMPLETE);
+         fire_cdrom_irq();
+@@ -2792,6 +2926,11 @@ static void process_read_stream(uint32_t cycles) {
+     if (read_delay <= 0) {
+         uint64_t timing_seq = cd_timing_begin_sector(
+             msf_to_lba(read_min, read_sec, read_sect));
++        if (cd_timing_enabled()) {
++            int lba = msf_to_lba(read_min, read_sec, read_sect);
++            cd_timing_head_set(&s_cdt_head, lba, lba, CD_TIMING_HOLD_SKEW, psx_cycle_count);
++            s_cdt_read_seeking = 0;
++        }
+         if (irq_flag == 0) {
+             if (rb_available()) {
+                 trace_cdrom('O', 0, (uint32_t)RB_.pos, 0);
+@@ -2912,6 +3051,10 @@ void cdrom_init(const char* cue_path) {
+      * pending.pending=0 / reading=0 and fork the CD digest at dig0. */
+     memset(&pending, 0, sizeof(pending));
+     memset(&queued_cmd, 0, sizeof(queued_cmd));
++    cd_timing_head_set(&s_cdt_head, 0, 0, 0, psx_cycle_count);
++    s_cdt_speed_due = s_cdt_cmd_written = s_cdt_cmd_due = 0;
++    s_cdt_read_seeking = 0;
++    s_cdt_in_store = 0;
+     cdrom_clear_pending_dataready();
+     read_min = read_sec = read_sect = 0;
+     reading = 0;
+@@ -3012,6 +3155,7 @@ uint32_t cdrom_read(uint32_t addr) {
+ void cdrom_write(uint32_t addr, uint32_t value) {
+     uint8_t val = (uint8_t)value;
+     trace_cdrom('W', addr, val, 1);
++    s_cdt_in_store = 1;
+ 
+     switch (addr) {
+     case 0x1F801800:
+@@ -3020,6 +3164,13 @@ void cdrom_write(uint32_t addr, uint32_t value) {
+ 
+     case 0x1F801801:
+         if (index_reg == 0) {
++            if (cd_event_log()) {
++                fprintf(cd_event_log(), "C %u %llu %02X %d", (unsigned)s_frame_count,
++                        (unsigned long long)psx_cycle_count, (unsigned)val, param_count);
++                for (int i = 0; i < param_count && i < PARAM_FIFO_SIZE; i++)
++                    fprintf(cd_event_log(), " %02X", (unsigned)param_fifo[i]);
++                fputc('\n', cd_event_log());
++            }
+             queue_or_exec_command(val);
+         } else if (index_reg == 3) {
+             cd_pending_vol[1][1] = val;   /* Right-CD -> Right-SPU */
+@@ -3066,6 +3217,9 @@ void cdrom_write(uint32_t addr, uint32_t value) {
+              * active->inactive edge rather than a bare !=0->0 so partial-clear
+              * writes don't mis-rearm. */
+             int had_active_irq = (irq_flag & 0x1F) != 0;
++            if (cd_event_log() && had_active_irq && (val & 0x1F))
++                fprintf(cd_event_log(), "A %u %llu %02X\n", (unsigned)s_frame_count,
++                        (unsigned long long)psx_cycle_count, (unsigned)val);
+             irq_flag &= ~(val & 0x1F);
+             if (had_active_irq && (irq_flag & 0x1F) == 0) {
+                 cdrom_intc_request_latched = 0;
+@@ -3084,12 +3238,15 @@ void cdrom_write(uint32_t addr, uint32_t value) {
+                 pending_present_due = psx_cycle_count + CDROM_PEND_PRESENT_DELAY;
+             process_pending(0);
+             try_execute_queued_command();
++            if (cd_timing_enabled())
++                psx_next_service_cycle = 0;   /* a waiting command may run now */
+         }
+         break;
+ 
+     default:
+         break;
+     }
++    s_cdt_in_store = 0;
+ }
+ 
+ /* Cycle-budgeted precise event slicing: guest CPU cycles until the CD-ROM
+@@ -3118,6 +3275,12 @@ uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
+             best = 0u;
+         }
+     }
++    /* Timing model: a written command executes at its due cycle (once the
++     * previous response is acknowledged). */
++    if (cd_timing_enabled() && queued_cmd.pending && irq_flag == 0) {
++        uint32_t d = (uint32_t)cycles_until_due(s_cdt_cmd_due);
++        if (d < best) best = d;
++    }
+     /* Scheduled release of a pended data-ready. */
+     if (pending_present_due != 0) {
+         uint32_t d = (uint32_t)cycles_until_due(pending_present_due);
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index b052f987..2e82328c 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "cpu_state.h"
++#include "rom_timing.h"
+ #include "cdrom.h"
+ #include "crash_trace.h"
+ #include "dma.h"
+@@ -1018,6 +1019,24 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
+ static uint32_t mem_ctrl[16];   /* indices 0..15 → addresses 0x1F801000..0x1F80103C */
+ static uint32_t ram_size_reg;   /* 0x1F801060 */
+ 
++/* BIOS ROM access times (rom_timing.h), kept in step with the BIOS ROM
++ * delay/size (1F801010h, index 4) and COM_DELAY (1F801020h, index 8)
++ * registers; power-on values until the BIOS writes them. */
++uint32_t g_psx_rom_access[3] = { 6u, 12u, 24u };
++static uint32_t s_rom_bios_delay = PSX_ROM_BIOS_DELAY_DEFAULT;
++static uint32_t s_rom_com_delay  = PSX_ROM_COM_DELAY_DEFAULT;
++
++static void mem_ctrl_timing_update(void) {
++    psx_mem_access_times(s_rom_bios_delay, s_rom_com_delay, g_psx_rom_access);
++}
++
++static void mem_ctrl_written(uint32_t idx) {
++    if (idx == 4u) s_rom_bios_delay = mem_ctrl[4];
++    else if (idx == 8u) s_rom_com_delay = mem_ctrl[8];
++    else return;
++    mem_ctrl_timing_update();
++}
++
+ /* KSEG2 no-op access telemetry (see the guards in the accessors). */
+ uint64_t g_kseg2_ignored_reads;
+ uint64_t g_kseg2_ignored_writes;
+@@ -1226,6 +1245,9 @@ void memory_init(const char* bios_path) {
+     /* Rematch re-enters without process exit — wipe sticky I/O regs that
+      * live outside device *_init (I_STAT/I_MASK cleared in interrupts_init). */
+     memset(mem_ctrl, 0, sizeof(mem_ctrl));
++    s_rom_bios_delay = PSX_ROM_BIOS_DELAY_DEFAULT;
++    s_rom_com_delay  = PSX_ROM_COM_DELAY_DEFAULT;
++    mem_ctrl_timing_update();
+     ram_size_reg = 0;
+     i_stat = 0;
+     i_mask = 0;
+@@ -1360,6 +1382,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
+     /* Memory control: 0x1F801000..0x1F801020 */
+     if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
+         mem_ctrl[(addr - 0x1F801000u) >> 2] = val;
++        mem_ctrl_written((addr - 0x1F801000u) >> 2);
+         return;
+     }
+     /* SIO: 0x1F801040..0x1F80105F */
+@@ -1486,6 +1509,7 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
+         uint32_t shift = 8u * (addr & 2u);
+         mem_ctrl[idx] = (mem_ctrl[idx] & ~(0xFFFFu << shift))
+                       | ((uint32_t)val << shift);
++        mem_ctrl_written(idx);
+         return;
+     }
+     /* RAM size register: 0x1F801060 — halfword lane RMW. */
+@@ -1608,6 +1632,7 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
+         uint32_t shift = 8u * (addr & 3u);
+         mem_ctrl[idx] = (mem_ctrl[idx] & ~(0xFFu << shift))
+                       | ((uint32_t)val << shift);
++        mem_ctrl_written(idx);
+         return;
+     }
+     /* RAM size register: 0x1F801060 — byte lane RMW (Tomba2 late attract). */
+@@ -2403,7 +2428,9 @@ static inline void psx_load_charge_cycles(uint32_t cycles) {
+ static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
+     /* Main RAM, mirrored across phys 0..0x7FFFFF (libretro.cpp:874 `A < 0x00800000`). */
+     if (phys < 0x00800000u) return 3u;
+-    /* BIOS ROM (905) and Expansion 1 / PIO (1134): no extra device wait. */
++    /* BIOS ROM (905) and Expansion 1 / PIO (1134): no extra device wait.
++     * (With the BIOS ROM timing on, psx_cyc_readmem charges ROM loads
++     * itself; rom_timing.h.) */
+     if (phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu) return 0u;
+     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0u;
+     /* Hardware MMIO window 0x1F801000..0x1F802FFF (921). */
+@@ -2445,6 +2472,20 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
+         cpu->ld_which_t = (uint8_t)arm_rt;
+         return;
+     }
++    /* BIOS ROM with the ROM timing on (rom_timing.h): the CPU waits out the
++     * whole 8-bit-bus access, the time of the load's width from the delay
++     * registers, with no fudge and nothing to give back (DuckStation charges
++     * the same; measured 25.4 cycles a word load, the instruction's own cycle
++     * included). */
++    if (psx_rom_timing_enabled()) {
++        const uint32_t *t = (phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu) ? g_psx_rom_access : NULL;
++        if (t) {
++            cpu->ld_absorb = 0u;
++            psx_cpu_charge(t[size >= 4u ? 2 : size == 2u ? 1 : 0]);
++            cpu->ld_which_t = (uint8_t)arm_rt;
++            return;
++        }
++    }
+     /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20).
+      * Combined with region+completion into one advance — deadline catch-up
+      * replays exact event boundaries, so splitting the charge is only host cost. */
+diff --git a/runtime/src/psx_icache.c b/runtime/src/psx_icache.c
+index 1aa40992..463468cc 100644
+--- a/runtime/src/psx_icache.c
++++ b/runtime/src/psx_icache.c
+@@ -9,6 +9,7 @@
+ #include "cpu_state.h"
+ #include "psx_cycles.h"
+ #include "psx_instr_cost.h"   /* psx_fetch_uncached: shared with both emitters */
++#include "rom_timing.h"
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -85,7 +86,10 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
+     cpu->read_absorb_which = 0u;
+ 
+     if (psx_fetch_uncached(addr)) { /* KSEG1 / uncached (BIOS ROM): every fetch */
+-        psx_cpu_charge(4u);   /* CPU charge: [timing] guest_cycle_scale */
++        /* A word from the BIOS ROM's 8-bit bus takes the ROM word time
++         * (rom_timing.h). */
++        psx_cpu_charge((psx_is_bios_rom(addr) && psx_rom_timing_enabled())
++                       ? g_psx_rom_access[2] : 4u);
+         return;
+     }
+ 
+diff --git a/runtime/tests/test_cd_timing.c b/runtime/tests/test_cd_timing.c
+new file mode 100644
+index 00000000..32251638
+--- /dev/null
++++ b/runtime/tests/test_cd_timing.c
+@@ -0,0 +1,165 @@
++/* CD drive timing model (Tekken 2 patch 0008): the arithmetic against
++ * DuckStation ffb33c28 measurements from recomp/tools/cd_timing/
++ * (probe.py, duckstation-ffb33c28.json), and the BIOS ROM access times
++ * (rom_timing.h). Each measured seek carries the
++ * drive's per-seek jitter (17,000..34,000 cycles; the model uses the mean),
++ * so seeks are checked to within 12,000 cycles. */
++
++#include "cd_timing.h"
++#include "rom_timing.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifdef _WIN32
++#define setenv(k, v, o) _putenv_s((k), (v))
++#define unsetenv(k) _putenv_s((k), "")
++#endif
++
++static int s_fail, s_checks;
++
++static void check(int ok, const char *what, long long got, long long want) {
++    s_checks++;
++    if (!ok) {
++        s_fail++;
++        fprintf(stderr, "FAIL %s: got %lld, want %lld\n", what, got, want);
++    }
++}
++
++static void near_(const char *what, long long got, long long want, long long tol) {
++    long long d = got - want;
++    check(d <= tol && d >= -tol, what, got, want);
++}
++
++/* Head two sectors before a settled SeekL target, then SeekL to `to`:
++ * measured time from the command taking effect to INT2. */
++static const struct { int from, to; long long measured; } k_seeks[] = {
++    {4498, 4501, 699544},        /* ahead within the track: 3 sectors */
++    {4498, 4507, 2057984},       /* 9 sectors, a whole track ahead */
++    {4498, 4508, 1724384},       /* one past it: a short jump */
++    {4498, 4499, 468608},        /* 1 ahead: at least 2 sectors */
++    {4498, 4498, 2057008},       /* on the spot: one track back, 9 forward */
++    {4498, 4490, 251952},        /* one track back, 1 forward */
++    {4498, 4488, 1714992},       /* past one track back: short jump */
++    {134998, 135005, 1602544},
++    {134998, 134986, 704256},
++    {269998, 270020, 1723472},
++    {4498, 4800, 1715592},       /* 302 at minute 1: short (switch near 331) */
++    {4498, 4140, 3414304},       /* 358: long */
++    {44998, 45160, 1723136},     /* minute 10: switch near 182 */
++    {44998, 45220, 3419272},
++    {134998, 135080, 1727208},   /* minute 30: near 112 */
++    {134998, 134860, 3409536},
++    {269998, 270040, 1726152},   /* minute 60: near 67 */
++    {269998, 269900, 3406144},
++    {22498, 23500, 3407312},
++    {22498, 15400, 3408472},     /* 7,098 sectors: still a jump */
++    {134998, 142400, 10193336},  /* 7,402: the sled */
++    {1998, 9300, 10184912},
++    {1998, 22000, 11780336},
++    {1998, 102000, 17492920},
++    {1998, 282000, 28031576},
++    {297998, 138000, 21127184},
++    {297998, 286000, 10885592},
++};
++
++int main(void) {
++    char name[96];
++
++    cd_timing_set_enabled(1);
++    check(cd_timing_enabled() == 1, "set_enabled(1)", cd_timing_enabled(), 1);
++    cd_timing_set_enabled(0);
++    check(cd_timing_enabled() == 0, "set_enabled(0)", cd_timing_enabled(), 0);
++    setenv("PSX_CD_TIMING", "1", 1);
++    cd_timing_set_enabled(-1);
++    check(cd_timing_enabled() == 1, "PSX_CD_TIMING=1", cd_timing_enabled(), 1);
++    setenv("PSX_CD_TIMING", "0", 1);
++    cd_timing_set_enabled(-1);
++    check(cd_timing_enabled() == 0, "PSX_CD_TIMING=0", cd_timing_enabled(), 0);
++    unsetenv("PSX_CD_TIMING");
++
++    /* First responses: 2,546 measured at 25,024..25,040 with ~24 cycles of
++     * probe polling; Init 80,016. */
++    near_("ack Getstat", cd_timing_ack_cycles(0x01), 25024, 40);
++    near_("ack ReadN", cd_timing_ack_cycles(0x06), 25024, 40);
++    near_("ack Init", cd_timing_ack_cycles(0x0A), 80016, 40);
++    check(cd_timing_sector_cycles(0) == 451584, "1x sector", cd_timing_sector_cycles(0), 451584);
++    check(cd_timing_sector_cycles(1) == 225792, "2x sector", cd_timing_sector_cycles(1), 225792);
++
++    /* Sectors per track by disc minute (lba + 150 = MSF). */
++    check(cd_timing_sectors_per_track(300) == 8, "spt minute 0", cd_timing_sectors_per_track(300), 8);
++    check(cd_timing_sectors_per_track(4350) == 9, "spt 01:00:00", cd_timing_sectors_per_track(4350), 9);
++    check(cd_timing_sectors_per_track(4349) == 8, "spt 00:59:74", cd_timing_sectors_per_track(4349), 8);
++    check(cd_timing_sectors_per_track(45300) == 11, "spt minute 10", cd_timing_sectors_per_track(45300), 11);
++    check(cd_timing_sectors_per_track(135300) == 15, "spt minute 30", cd_timing_sectors_per_track(135300), 15);
++    check(cd_timing_sectors_per_track(297300) == 20, "spt minute 66", cd_timing_sectors_per_track(297300), 20);
++    check(cd_timing_sectors_per_track(400000) == 20, "spt past the table", cd_timing_sectors_per_track(400000), 20);
++
++    for (size_t i = 0; i < sizeof(k_seeks) / sizeof(k_seeks[0]); i++) {
++        snprintf(name, sizeof name, "seek %d -> %d", k_seeks[i].from, k_seeks[i].to);
++        near_(name, cd_timing_seek_cycles(k_seeks[i].from, k_seeks[i].to, 1), k_seeks[i].measured, 12000);
++    }
++    /* Single speed (seek1x, base 45000): 5 ahead = 7 sectors at 1x. */
++    near_("seek 1x 44998 -> 45005", cd_timing_seek_cycles(44998, 45005, 0), 3216688 - 25000, 12000);
++    near_("seek 1x 44998 -> 65000", cd_timing_seek_cycles(44998, 65000, 0), 11803672 - 25000, 12000);
++
++    /* Pause right after a sector at double speed: (spt - 2) sectors, less
++     * the time since that sector (the command's own 25,000). Measured from
++     * the write: 1,354,728 at minute 0, 2,032,112 at minute 10, 4,064,248
++     * at minute 61. */
++    near_("pause 2x minute 0", 25000 + cd_timing_pause_cycles(1, 1, 300, 25000), 1354728, 100);
++    near_("pause 2x minute 10", 25000 + cd_timing_pause_cycles(1, 1, 45300, 25000), 2032112, 100);
++    near_("pause 2x minute 61", 25000 + cd_timing_pause_cycles(1, 1, 274800, 25000), 4064248, 100);
++    near_("pause 1x minute 30", 25000 + cd_timing_pause_cycles(1, 0, 135300, 25000), 5870624, 100);
++    near_("pause paused", 25000 + cd_timing_pause_cycles(0, 1, 300, 0), 52024, 100);
++
++    /* Init at single speed near the start: the 4,000,000 minimum. From
++     * double speed at 45,404: spin-down plus the sled home (37,675,488
++     * measured from the write, 80,000 of it the first response). */
++    near_("init 1x", 80000 + cd_timing_init_cycles(0, cd_timing_seek_cycles(30, 0, 0)), 4080080, 100);
++    near_("init from 2x",
++          80000 + cd_timing_init_cycles(cd_timing_speed_change_cycles(0), cd_timing_seek_cycles(45404, 0, 0)),
++          37675488, 60000);
++    near_("getid", 25000 + cd_timing_getid_cycles(), 58888, 100);
++    /* Speed change: 0.6 s up, 0.7 s down. */
++    near_("speed up", cd_timing_speed_change_cycles(1), 20321280, 20000);
++    near_("speed down", cd_timing_speed_change_cycles(0), 23708160, 20000);
++
++    /* Holding: after a SeekL to 45000 the head is at 44998 and wraps within
++     * one track (11 sectors at minute 10) behind 45000. */
++    {
++        CdTimingHead h;
++        cd_timing_head_set(&h, 45000, 44998, CD_TIMING_HOLD_SKEW, 1000);
++        check(cd_timing_head_hold(&h, 1000 + 225791, 1) == 44998, "hold before a sector",
++              h.subq, 44998);
++        check(cd_timing_head_hold(&h, 1000 + 225792, 1) == 44999, "hold one sector", h.subq, 44999);
++        check(cd_timing_head_hold(&h, 1000 + 4 * 225792, 1) == 44991, "hold wraps a track back",
++              h.subq, 44991);
++        check(cd_timing_head_hold(&h, 1000 + 15 * 225792, 1) == 44991, "hold a whole track later",
++              h.subq, 44991);
++        /* Measured (holdpause2x 45000): read at 45000, Pause, wait 240,000
++         * cycles more, SeekL 45000 took 2,533,392 from the write. */
++    }
++
++    /* BIOS ROM access times from the delay registers (rom_timing.h). Boot
++     * values: a word 24 cycles (measured 25.4 per load with the load's own
++     * cycle, rom_probe.py). OpenBIOS's COM_DELAY 0000132Ch: a word 32, so an
++     * instruction fetched from ROM takes 33 (measured 99 a pass of the
++     * three-instruction delay loop in initCDRom). */
++    {
++        uint32_t t[3];
++        psx_mem_access_times(PSX_ROM_BIOS_DELAY_DEFAULT, PSX_ROM_COM_DELAY_DEFAULT, t);
++        check(t[0] == 6 && t[1] == 12 && t[2] == 24, "rom 0013243F/00031125 word", t[2], 24);
++        check(t[0] == 6, "rom 0013243F/00031125 byte", t[0], 6);
++        check(t[1] == 12, "rom 0013243F/00031125 half", t[1], 12);
++        psx_mem_access_times(PSX_ROM_BIOS_DELAY_DEFAULT, 0x132Cu, t);
++        check(t[2] == 32, "rom 0013243F/0000132C word", t[2], 32);
++        check(t[0] == 8 && t[1] == 16, "rom 0013243F/0000132C byte+half", t[0] * 100 + t[1], 816);
++        /* A 16-bit device (bit 12) reads a halfword in one access. */
++        psx_mem_access_times(0x0013343Fu, PSX_ROM_COM_DELAY_DEFAULT, t);
++        check(t[1] == t[0] && t[2] == 12, "16-bit bus", t[2], 12);
++    }
++
++    printf("cd_timing_test: %d checks, %d failed\n", s_checks, s_fail);
++    return s_fail ? 1 : 0;
++}

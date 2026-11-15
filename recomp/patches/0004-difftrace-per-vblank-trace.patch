@@ -1,0 +1,765 @@
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 88712695..efc3f9c5 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -2705,6 +2705,10 @@ static inline void pc_probe_observe(uint32_t block_leader_phys)
+  * block-leader PC — interior loop tops, prologue exits — not just function
+  * entries, which is required for a clean, KNOWN-instruction-sequence ruler.
+  * Disarmed cost = one volatile load + return (see cyc_watch_observe). */
++/* Tekken 2 differential trace PC log (difftrace.h, T2DIFF_PCLOG). */
++extern int difftrace_pclog_on;
++void difftrace_pc(uint32_t pc_phys, uint64_t tick);
++
+ void debug_server_cyc_observe(uint32_t block_leader_phys) {
+ #ifdef PSX_NO_DEBUG_TOOLS
+     (void)block_leader_phys;
+@@ -2712,6 +2716,7 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
+ #else
+     uint32_t phys = block_leader_phys & 0x1FFFFFFFu;
+     g_psx_last_block = phys;
++    if (difftrace_pclog_on) difftrace_pc(phys, psx_get_cycle_count());
+     if (s_fmv_quiet) return;
+     /* ND debug: PSX_ND_WOOD_CLEAR80=1 clears model+184 bit0x80 at the flag-load
+      * leader so 0x5CF/'cras' models enter NdIntroWoodBatchSetup's textured path.
+@@ -10578,6 +10583,29 @@ static void handle_display_ring_get(int id, const char *json)
+              e->di.depth24 ? 1 : 0);
+ }
+ 
++
++/* Display capture for difftrace shots: same pixels as screenshot_file. */
++static int dt_host_shot(const char *path)
++{
++    GpuDisplayInfo di;
++    gpu_get_display_info(&di);
++    if (di.disabled || di.width == 0 || di.height == 0) return -1;
++    uint32_t w = di.width;  if (w > 640) w = 640;
++    uint32_t h = di.height; if (h > 512) h = 512;
++    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
++    if (!rgb) return -1;
++    for (uint32_t y = 0; y < h; y++)
++        for (uint32_t x = 0; x < w; x++) {
++            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
++            gpu_display_pixel_rgb(&di, x, y, &p[0], &p[1], &p[2]);
++        }
++    FILE *f = fopen(path, "wb");
++    int ok = f && png_write_rgb(f, rgb, w, h);
++    if (f) fclose(f);
++    free(rgb);
++    return ok ? 0 : -1;
++}
++
+ static void handle_screenshot_file(int id, const char *json)
+ {
+     GpuDisplayInfo di;
+@@ -17635,8 +17663,32 @@ void debug_server_poll(void)
+     SDL_UnlockMutex(s_io_mutex);
+ }
+ 
++
++/* ---- Tekken 2 differential trace (recomp/tools/diff) ----
++ * Off unless T2DIFF_TRACE / T2DIFF_SCRIPT is set. Records RAM chunk hashes and
++ * key regions once per VBlank and drives port 1 from a state-anchored script,
++ * the same code DuckStation's regtest runner uses on the other side. */
++#define DIFFTRACE_SIDE "psxrecomp"
++#define DIFFTRACE_IMPLEMENTATION
++#include "difftrace.h"
++extern uint8_t *g_psx_ram;
++static const uint8_t *dt_host_ram(void) { return g_psx_ram; }
++static uint8_t dt_host_scratch(uint32_t off) { return psx_read_byte(0x1F800000u + (off & 1023u)); }
++static int dt_host_shot(const char *path);
++static void dt_host_vblank(uint32_t frame)
++{
++    static int set;
++    if (!set) {
++        DiffTraceHost h = { dt_host_ram, dt_host_scratch, dt_host_shot };
++        difftrace_set_host(&h);
++        set = 1;
++    }
++    difftrace_vblank(frame);
++}
++
+ void debug_server_record_frame(void)
+ {
++    dt_host_vblank((uint32_t)s_frame_count);
+     if (s_fmv_quiet) {
+         s_history_count = s_frame_count + 1;
+         s_frame_count++;
+@@ -17822,12 +17874,14 @@ static int input_route_next(unsigned port)
+  * Keep deferred routes excluded too; they belong to an injected-input session. */
+ int debug_server_input_override_active(void)
+ {
+-    return s_input_override >= 0 || s_axis_override || s_host_layer ||
++    return difftrace_active() || s_input_override >= 0 || s_axis_override || s_host_layer ||
+         (s_input_route_active && s_input_route_port == 1);
+ }
+ 
+ int debug_server_get_input_override(void)
+ {
++    int dt_word = difftrace_pad();
++    if (dt_word >= 0) return dt_word;
+     int current = input_route_next(1);
+     if (current >= 0) return current;
+     current = s_input_override;
+diff --git a/runtime/src/difftrace.h b/runtime/src/difftrace.h
+new file mode 100644
+index 00000000..9d78536d
+--- /dev/null
++++ b/runtime/src/difftrace.h
+@@ -0,0 +1,552 @@
++/* difftrace.h: per-VBlank state trace and state-anchored input script.
++ *
++ * One file, compiled into both sides of the Tekken 2 differential test:
++ * the psxrecomp runtime (patches/0004-difftrace-per-vblank-trace.patch) and
++ * DuckStation's regtest runner (tools/diff/duckstation/regtest-difftrace.patch).
++ * Both sides call difftrace_vblank() once per guest VBlank and feed
++ * difftrace_pad() to port 1, so the same script drives the same game state
++ * on both, and both write the same binary trace format.
++ *
++ * Off unless T2DIFF_TRACE or T2DIFF_SCRIPT is set. Environment:
++ *   T2DIFF_TRACE        binary trace output (format below)
++ *   T2DIFF_SCRIPT       input script (format below)
++ *   T2DIFF_EVENTS       text event log (default: <trace>.events)
++ *   T2DIFF_REGIONS      "addr:len,addr:len" raw RAM copied every VBlank
++ *   T2DIFF_DUMP_FRAMES  "f,f-f" full 2 MiB RAM dumps (<trace>.ram-NNNNNN.bin)
++ *   T2DIFF_SHOT_FRAMES  "f,f-f" display PNGs via the host shot callback
++ *   T2DIFF_SHOT_DIR     where shots go (default: <trace>.shots)
++ *   T2DIFF_PCLOG        PC log output (text), with T2DIFF_PCS
++ *   T2DIFF_PCS          "pc,pc,..." physical PCs to stamp (at most 64)
++ *   T2DIFF_PCMAX        hits logged per PC (default 64)
++ *   T2DIFF_PCLOG_FRAMES "f-f,f" frames the PC log covers (default all); the
++ *                       PC log also gets every IRQ raise, "Q frame tick bit"
++ *   T2DIFF_GPULOG       GP0 draw-time log output (text)
++ *   T2DIFF_GPULOG_FRAMES "f-f,f" frames to log (default all)
++ *   T2DIFF_IOLOG        device register log output (text)
++ *   T2DIFF_IOLOG_FRAMES "f-f,f" frames the IO log covers (default all)
++ *
++ * PC log: each side calls difftrace_pc() while difftrace_pclog_on is nonzero,
++ * DuckStation before every instruction it interprets (run it with
++ * -cpu Interpreter), the recomp at every basic-block leader
++ * (debug_server_cyc_observe), so the PCs must be block leaders. The first
++ * T2DIFF_PCMAX hits of each listed PC are written as "P frame tick pc", tick
++ * being the side's CPU cycle count, to compare where two runs spend time
++ * between two CD commands (tools/cd_timing/cdlog.py) or two VBlanks.
++ *
++ * GP0 draw-time log: each side calls difftrace_gpu() for every GP0 command
++ * its GPU timing charges (DuckStation GPU::AddCommandTicks, the recomp's
++ * gpu_timing_command), with the opcode and the GPU ticks charged, written as
++ * "G frame tick op ticks" for the frames in T2DIFF_GPULOG_FRAMES, to compare
++ * the two draw-time models command by command.
++ *
++ * IO log: each side calls difftrace_io() at the device registers below, with
++ * its CPU cycle count, written as "I frame tick kind value" (hex value).
++ * Kinds: 'G' GP1 write, 'S' GPUSTAT read, 'J' JOY_DATA write, 'j' JOY_DATA
++ * read, 'C' JOY_CTRL write, 's' JOY_STAT read, 'M' JOY_MODE write, 'B'
++ * JOY_BAUD write. Status reads are logged only when the value changes from
++ * the last one logged (GPUSTAT: bits 13 and 31; JOY_STAT: bits 0-9), so a
++ * polling loop gives the first read that saw each change. IRQ raises go to
++ * the IO log too ("Q frame tick bit"). DuckStation logs in either CPU mode.
++ *
++ * Script, one step per line, '#' starts a comment. Each VBlank the script
++ * produces the pad word the guest sees during the next frame:
++ *   wait N                       N VBlanks with no buttons
++ *   pad BUTTONS N                N VBlanks holding BUTTONS (x+right, or 0xWORD
++ *                                active-low, or none)
++ *   wait_eq ADDR SIZE VALUE [T]  no buttons until the SIZE-byte value at ADDR
++ *   wait_ne ADDR SIZE VALUE [T]  equals / differs from VALUE; fails the run
++ *   wait_ge ADDR SIZE VALUE [T]  after T VBlanks (default 6000)
++ *   wait_lt ADDR SIZE VALUE [T]
++ *   mark LABEL                   logs LABEL (an alignment anchor)
++ *   poke ADDR SIZE VALUE         writes VALUE to guest RAM at once (used to give
++ *                                both sides the same RNG seed at an anchor)
++ *   end                          script done; difftrace_finished() turns on
++ * A wait_* that holds on the VBlank it starts ends at once, so the next step
++ * already drives that VBlank's pad word.
++ *
++ * Trace format, little-endian:
++ *   header: "T2DT" u32 version(1) u32 n_regions u32 chunk_shift(16)
++ *           n_regions x {u32 addr, u32 len} u32 side_len, side bytes
++ *   record: u32 frame u16 pad u16 step u32 flags
++ *           u64 chunk_hash[32] (2 MiB RAM in 64 KiB chunks) u64 scratch_hash
++ *           region bytes, in header order
++ *   flags: bit0 script active, bit1 finished, bit2 failed (wait timeout)
++ * The record for VBlank F holds RAM as the guest left it when VBlank F came,
++ * and the pad word the script chose for the frame after it.
++ */
++#ifndef T2_DIFFTRACE_H
++#define T2_DIFFTRACE_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct DiffTraceHost {
++    const uint8_t *(*ram)(void);           /* 2 MiB main RAM, physical 0; writable (poke) */
++    uint8_t (*scratch_byte)(uint32_t off); /* scratchpad 0..1023, may be NULL */
++    int (*shot)(const char *png_path);     /* display capture, may be NULL */
++} DiffTraceHost;
++
++void difftrace_set_host(const DiffTraceHost *host);
++/* Call once per VBlank. Lazily reads the environment on the first call. */
++void difftrace_vblank(uint32_t frame);
++/* Active-low pad word for port 1, or -1 when no script is loaded. */
++int difftrace_pad(void);
++int difftrace_active(void);
++int difftrace_finished(void);
++/* PC log (see above). Starts at -1 (not read yet): the first difftrace_pc()
++ * call reads the environment and sets it to 0 or 1. */
++extern int difftrace_pclog_on;
++void difftrace_pc(uint32_t pc_phys, uint64_t tick);
++/* IRQ raises in the PC log ("Q frame tick bit"), same frame window. */
++void difftrace_irq(uint32_t bit, uint64_t tick);
++/* GP0 draw-time log (see above); same -1/0/1 convention. */
++extern int difftrace_gpulog_on;
++void difftrace_gpu(uint32_t op, uint32_t ticks, uint64_t tick);
++/* IO log (see above); same -1/0/1 convention. */
++extern int difftrace_iolog_on;
++void difftrace_io(char kind, uint32_t value, uint64_t tick);
++
++#ifdef __cplusplus
++}
++#endif
++
++#ifdef DIFFTRACE_IMPLEMENTATION
++
++#include <ctype.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define DT_RAM_SIZE      0x200000u
++#define DT_CHUNK_SHIFT   16u
++#define DT_CHUNKS        (DT_RAM_SIZE >> DT_CHUNK_SHIFT)
++#define DT_MAX_REGIONS   16
++#define DT_MAX_STEPS     8192
++#define DT_MAX_RANGES    256
++
++enum { DT_WAIT, DT_PAD, DT_WAIT_EQ, DT_WAIT_NE, DT_WAIT_GE, DT_WAIT_LT, DT_MARK, DT_END, DT_POKE };
++
++typedef struct {
++    int kind;
++    uint32_t n;          /* frames, or timeout for wait_* */
++    uint32_t addr, size, value;
++    uint16_t word;       /* active-low pad word */
++    char label[48];
++    int line;
++} DtStep;
++
++typedef struct { uint32_t lo, hi; } DtRange;
++
++static struct {
++    int init, enabled;
++    DiffTraceHost host;
++    FILE *trace, *events;
++    char trace_path[1024], shot_dir[1024];
++    uint32_t n_regions;
++    uint32_t reg_addr[DT_MAX_REGIONS], reg_len[DT_MAX_REGIONS];
++    DtStep *steps;
++    uint32_t n_steps, step, remaining, started, start_frame;
++    int has_script, finished, failed;
++    int pad;
++    DtRange dump[DT_MAX_RANGES]; uint32_t n_dump;
++    DtRange shot[DT_MAX_RANGES]; uint32_t n_shot;
++    uint32_t last_frame;
++} dt;
++
++#define DT_MAX_PCS 64
++static struct {
++    FILE *f;
++    uint32_t pc[DT_MAX_PCS], hits[DT_MAX_PCS], n, max;
++    DtRange frames[DT_MAX_RANGES]; uint32_t n_frames;
++} dtpc;
++
++int difftrace_pclog_on = -1;
++
++static struct {
++    FILE *f;
++    DtRange frames[DT_MAX_RANGES]; uint32_t n_frames;
++} dtgpu;
++
++int difftrace_gpulog_on = -1;
++
++static struct {
++    FILE *f;
++    DtRange frames[DT_MAX_RANGES]; uint32_t n_frames;
++    uint32_t last_gpustat, last_joystat;
++    int have_gpustat, have_joystat;
++} dtio;
++
++int difftrace_iolog_on = -1;
++
++static void dt_parse_ranges(const char *s, DtRange *out, uint32_t *n);
++static int dt_in(const DtRange *r, uint32_t n, uint32_t f);
++
++void difftrace_gpu(uint32_t op, uint32_t ticks, uint64_t tick)
++{
++    if (difftrace_gpulog_on < 0) {
++        const char *path = getenv("T2DIFF_GPULOG");
++        difftrace_gpulog_on = 0;
++        if (!path || !*path || !(dtgpu.f = fopen(path, "w"))) return;
++        dt_parse_ranges(getenv("T2DIFF_GPULOG_FRAMES"), dtgpu.frames, &dtgpu.n_frames);
++        difftrace_gpulog_on = 1;
++    }
++    if (difftrace_gpulog_on <= 0) return;
++    if (dtgpu.n_frames && !dt_in(dtgpu.frames, dtgpu.n_frames, dt.last_frame)) return;
++    fprintf(dtgpu.f, "G %u %llu %02X %u\n", dt.last_frame, (unsigned long long)tick, op & 0xFFu, ticks);
++    fflush(dtgpu.f);
++}
++
++static void dt_iolog_init(void)
++{
++    const char *path = getenv("T2DIFF_IOLOG");
++    difftrace_iolog_on = 0;
++    if (!path || !*path || !(dtio.f = fopen(path, "w"))) return;
++    dt_parse_ranges(getenv("T2DIFF_IOLOG_FRAMES"), dtio.frames, &dtio.n_frames);
++    difftrace_iolog_on = 1;
++}
++
++void difftrace_io(char kind, uint32_t value, uint64_t tick)
++{
++    if (difftrace_iolog_on < 0) dt_iolog_init();
++    if (difftrace_iolog_on <= 0) return;
++    if (dtio.n_frames && !dt_in(dtio.frames, dtio.n_frames, dt.last_frame)) return;
++    if (kind == 'S') {
++        value &= (1u << 13) | (1u << 31);
++        if (dtio.have_gpustat && value == dtio.last_gpustat) return;
++        dtio.last_gpustat = value; dtio.have_gpustat = 1;
++    } else if (kind == 's') {
++        value &= 0x3FFu;
++        if (dtio.have_joystat && value == dtio.last_joystat) return;
++        dtio.last_joystat = value; dtio.have_joystat = 1;
++    }
++    fprintf(dtio.f, "I %u %llu %c %X\n", dt.last_frame, (unsigned long long)tick, kind, value);
++    fflush(dtio.f);
++}
++
++void difftrace_irq(uint32_t bit, uint64_t tick)
++{
++    if (difftrace_iolog_on < 0) dt_iolog_init();
++    if (difftrace_iolog_on > 0 && (!dtio.n_frames || dt_in(dtio.frames, dtio.n_frames, dt.last_frame))) {
++        fprintf(dtio.f, "Q %u %llu %u\n", dt.last_frame, (unsigned long long)tick, bit);
++        fflush(dtio.f);
++    }
++    if (difftrace_pclog_on <= 0 || !dtpc.f) return;
++    if (dtpc.n_frames && !dt_in(dtpc.frames, dtpc.n_frames, dt.last_frame)) return;
++    fprintf(dtpc.f, "Q %u %llu %u\n", dt.last_frame, (unsigned long long)tick, bit);
++    fflush(dtpc.f);
++}
++
++void difftrace_pc(uint32_t pc_phys, uint64_t tick)
++{
++    if (difftrace_pclog_on < 0) {
++        const char *path = getenv("T2DIFF_PCLOG"), *pcs = getenv("T2DIFF_PCS"), *mx = getenv("T2DIFF_PCMAX");
++        difftrace_pclog_on = 0;
++        if (!path || !*path || !pcs || !*pcs) return;
++        while (*pcs && dtpc.n < DT_MAX_PCS) {
++            char *end;
++            uint32_t v = (uint32_t)strtoul(pcs, &end, 0);
++            if (end == pcs) break;
++            dtpc.pc[dtpc.n++] = v & 0x1FFFFFFFu;
++            pcs = end; while (*pcs == ',' || *pcs == ' ') pcs++;
++        }
++        dtpc.max = (mx && *mx) ? (uint32_t)strtoul(mx, NULL, 0) : 64u;
++        dt_parse_ranges(getenv("T2DIFF_PCLOG_FRAMES"), dtpc.frames, &dtpc.n_frames);
++        dtpc.f = fopen(path, "w");
++        if (!dtpc.f || !dtpc.n) return;
++        difftrace_pclog_on = 1;
++    }
++    if (difftrace_pclog_on <= 0) return;
++    if (dtpc.n_frames && !dt_in(dtpc.frames, dtpc.n_frames, dt.last_frame)) return;
++    pc_phys &= 0x1FFFFFFFu;
++    for (uint32_t i = 0; i < dtpc.n; i++) {
++        if (dtpc.pc[i] != pc_phys) continue;
++        if (dtpc.hits[i]++ < dtpc.max) {
++            fprintf(dtpc.f, "P %u %llu %08X\n", dt.last_frame, (unsigned long long)tick, pc_phys);
++            fflush(dtpc.f);
++        }
++        return;
++    }
++}
++
++static const char *const dt_button_names[16] = {
++    "select", "l3", "r3", "start", "up", "right", "down", "left",
++    "l2", "r2", "l1", "r1", "triangle", "circle", "x", "square",
++};
++
++void difftrace_set_host(const DiffTraceHost *host) { dt.host = *host; }
++
++static void dt_event(uint32_t frame, const char *fmt, const char *a, uint32_t b)
++{
++    if (!dt.events) return;
++    fprintf(dt.events, "%u\t%u\t", frame, dt.step);
++    fprintf(dt.events, fmt, a, b);
++    fputc('\n', dt.events);
++    fflush(dt.events);
++}
++
++static int dt_parse_buttons(const char *s, uint16_t *word)
++{
++    if (!strcmp(s, "none")) { *word = 0xFFFF; return 1; }
++    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++        *word = (uint16_t)strtoul(s, NULL, 16); return 1;
++    }
++    uint16_t w = 0xFFFF;
++    char buf[128];
++    strncpy(buf, s, sizeof buf - 1); buf[sizeof buf - 1] = 0;
++    for (char *tok = strtok(buf, "+"); tok; tok = strtok(NULL, "+")) {
++        int found = 0;
++        for (int i = 0; i < 16; i++)
++            if (!strcmp(tok, dt_button_names[i])) { w &= (uint16_t)~(1u << i); found = 1; }
++        if (!found) return 0;
++    }
++    *word = w; return 1;
++}
++
++static void dt_parse_ranges(const char *s, DtRange *out, uint32_t *n)
++{
++    *n = 0;
++    if (!s) return;
++    while (*s && *n < DT_MAX_RANGES) {
++        char *end;
++        uint32_t lo = (uint32_t)strtoul(s, &end, 0), hi = lo;
++        if (end == s) break;
++        s = end;
++        if (*s == '-') { hi = (uint32_t)strtoul(s + 1, &end, 0); s = end; }
++        out[*n].lo = lo; out[*n].hi = hi; (*n)++;
++        while (*s == ',' || *s == ' ') s++;
++    }
++}
++
++static int dt_in(const DtRange *r, uint32_t n, uint32_t f)
++{
++    for (uint32_t i = 0; i < n; i++) if (f >= r[i].lo && f <= r[i].hi) return 1;
++    return 0;
++}
++
++static int dt_load_script(const char *path)
++{
++    FILE *f = fopen(path, "r");
++    if (!f) { fprintf(stderr, "difftrace: cannot open script %s\n", path); return 0; }
++    dt.steps = (DtStep *)calloc(DT_MAX_STEPS, sizeof(DtStep));
++    char line[512];
++    int lineno = 0;
++    while (fgets(line, sizeof line, f)) {
++        lineno++;
++        char *hash = strchr(line, '#'); if (hash) *hash = 0;
++        char op[32] = "", a[128] = "", b[64] = "", c[64] = "", d[64] = "";
++        int got = sscanf(line, "%31s %127s %63s %63s %63s", op, a, b, c, d);
++        if (got <= 0) continue;
++        if (dt.n_steps >= DT_MAX_STEPS) { fprintf(stderr, "difftrace: script too long\n"); break; }
++        DtStep *s = &dt.steps[dt.n_steps];
++        memset(s, 0, sizeof *s);
++        s->line = lineno;
++        int ok = 1;
++        if (!strcmp(op, "wait") && got >= 2) { s->kind = DT_WAIT; s->n = (uint32_t)strtoul(a, NULL, 0); }
++        else if (!strcmp(op, "pad") && got >= 3) {
++            s->kind = DT_PAD; ok = dt_parse_buttons(a, &s->word); s->n = (uint32_t)strtoul(b, NULL, 0);
++        }
++        else if (!strncmp(op, "wait_", 5) && got >= 4) {
++            s->kind = !strcmp(op, "wait_eq") ? DT_WAIT_EQ : !strcmp(op, "wait_ne") ? DT_WAIT_NE
++                    : !strcmp(op, "wait_ge") ? DT_WAIT_GE : !strcmp(op, "wait_lt") ? DT_WAIT_LT : -1;
++            ok = s->kind >= 0;
++            s->addr = (uint32_t)strtoul(a, NULL, 0) & (DT_RAM_SIZE - 1);
++            s->size = (uint32_t)strtoul(b, NULL, 0);
++            s->value = (uint32_t)strtoul(c, NULL, 0);
++            s->n = got >= 5 ? (uint32_t)strtoul(d, NULL, 0) : 6000u;
++            ok = ok && (s->size == 1 || s->size == 2 || s->size == 4);
++            snprintf(s->label, sizeof s->label, "%s %s %s %s", op, a, b, c);
++        }
++        else if (!strcmp(op, "poke") && got >= 4) {
++            s->kind = DT_POKE;
++            s->addr = (uint32_t)strtoul(a, NULL, 0) & (DT_RAM_SIZE - 1);
++            s->size = (uint32_t)strtoul(b, NULL, 0);
++            s->value = (uint32_t)strtoul(c, NULL, 0);
++            ok = s->size == 1 || s->size == 2 || s->size == 4;
++            snprintf(s->label, sizeof s->label, "%s %s %s", a, b, c);
++        }
++        else if (!strcmp(op, "mark") && got >= 2) { s->kind = DT_MARK; strncpy(s->label, a, sizeof s->label - 1); }
++        else if (!strcmp(op, "end")) { s->kind = DT_END; }
++        else ok = 0;
++        if (!ok || ((s->kind == DT_WAIT || s->kind == DT_PAD) && s->n == 0)) {
++            fprintf(stderr, "difftrace: bad script line %d: %s\n", lineno, line);
++            fclose(f); return 0;
++        }
++        dt.n_steps++;
++    }
++    fclose(f);
++    return 1;
++}
++
++static void dt_init(void)
++{
++    dt.init = 1;
++    dt.pad = -1;
++    const char *trace = getenv("T2DIFF_TRACE"), *script = getenv("T2DIFF_SCRIPT");
++    if ((!trace || !*trace) && (!script || !*script)) return;
++    if (!dt.host.ram) { fprintf(stderr, "difftrace: no host RAM accessor\n"); return; }
++    if (script && *script) {
++        if (!dt_load_script(script)) { fprintf(stderr, "difftrace: script rejected\n"); exit(3); }
++        dt.has_script = 1;
++        dt.pad = 0xFFFF;
++    }
++    const char *regions = getenv("T2DIFF_REGIONS");
++    while (regions && *regions && dt.n_regions < DT_MAX_REGIONS) {
++        char *end;
++        uint32_t addr = (uint32_t)strtoul(regions, &end, 0) & (DT_RAM_SIZE - 1);
++        if (*end != ':') break;
++        uint32_t len = (uint32_t)strtoul(end + 1, &end, 0);
++        if (addr + len > DT_RAM_SIZE) len = DT_RAM_SIZE - addr;
++        dt.reg_addr[dt.n_regions] = addr; dt.reg_len[dt.n_regions] = len; dt.n_regions++;
++        regions = end; while (*regions == ',') regions++;
++    }
++    dt_parse_ranges(getenv("T2DIFF_DUMP_FRAMES"), dt.dump, &dt.n_dump);
++    dt_parse_ranges(getenv("T2DIFF_SHOT_FRAMES"), dt.shot, &dt.n_shot);
++    if (trace && *trace) {
++        strncpy(dt.trace_path, trace, sizeof dt.trace_path - 1);
++        dt.trace = fopen(trace, "wb");
++        if (!dt.trace) { fprintf(stderr, "difftrace: cannot open %s\n", trace); exit(3); }
++        static const char side[] = DIFFTRACE_SIDE;
++        uint32_t hdr[4] = { 0x54443254u /* "T2DT" */, 1u, dt.n_regions, DT_CHUNK_SHIFT };
++        fwrite(hdr, 4, 4, dt.trace);
++        for (uint32_t i = 0; i < dt.n_regions; i++) {
++            fwrite(&dt.reg_addr[i], 4, 1, dt.trace);
++            fwrite(&dt.reg_len[i], 4, 1, dt.trace);
++        }
++        uint32_t side_len = (uint32_t)strlen(side);
++        fwrite(&side_len, 4, 1, dt.trace);
++        fwrite(side, 1, side_len, dt.trace);
++    }
++    const char *ev = getenv("T2DIFF_EVENTS");
++    char evbuf[1100];
++    if ((!ev || !*ev) && trace && *trace) { snprintf(evbuf, sizeof evbuf, "%s.events", trace); ev = evbuf; }
++    if (ev && *ev) dt.events = fopen(ev, "w");
++    const char *sd = getenv("T2DIFF_SHOT_DIR");
++    if (sd && *sd) strncpy(dt.shot_dir, sd, sizeof dt.shot_dir - 1);
++    else snprintf(dt.shot_dir, sizeof dt.shot_dir, "%s.shots", trace ? trace : "difftrace");
++    dt.enabled = 1;
++    fprintf(stderr, "difftrace: on (%s), %u steps, %u regions\n", DIFFTRACE_SIDE, dt.n_steps, dt.n_regions);
++}
++
++static uint64_t dt_hash(const uint8_t *p, uint32_t len)
++{
++    uint64_t h = 0xcbf29ce484222325ull;
++    for (uint32_t i = 0; i + 8 <= len; i += 8) {
++        uint64_t w; memcpy(&w, p + i, 8);
++        h = (h ^ w) * 0x100000001b3ull;
++        h ^= h >> 29;
++    }
++    return h;
++}
++
++static uint32_t dt_read(const uint8_t *ram, uint32_t addr, uint32_t size)
++{
++    uint32_t v = 0;
++    for (uint32_t i = 0; i < size; i++) v |= (uint32_t)ram[(addr + i) & (DT_RAM_SIZE - 1)] << (8 * i);
++    return v;
++}
++
++static void dt_advance(uint32_t frame, const uint8_t *ram)
++{
++    dt.pad = 0xFFFF;
++    while (dt.step < dt.n_steps) {
++        DtStep *s = &dt.steps[dt.step];
++        if (!dt.started) {
++            dt.started = 1; dt.start_frame = frame; dt.remaining = s->n;
++        }
++        switch (s->kind) {
++        case DT_MARK:
++            dt_event(frame, "mark\t%s%.0u", s->label, 0);
++            break;
++        case DT_POKE: {
++            uint8_t *w = (uint8_t *)ram; /* both hosts hand out writable guest RAM */
++            for (uint32_t i = 0; i < s->size; i++) w[(s->addr + i) & (DT_RAM_SIZE - 1)] = (uint8_t)(s->value >> (8 * i));
++            dt_event(frame, "poke\t%s%.0u", s->label, 0);
++            break;
++        }
++        case DT_END:
++            dt_event(frame, "end%s%.0u", "", 0);
++            dt.finished = 1;
++            dt.step = dt.n_steps;
++            return;
++        case DT_WAIT:
++        case DT_PAD:
++            if (dt.remaining > 0) {
++                if (s->kind == DT_PAD) dt.pad = s->word;
++                dt.remaining--;
++                return;
++            }
++            break;
++        default: {
++            uint32_t v = dt_read(ram, s->addr, s->size);
++            int hit = s->kind == DT_WAIT_EQ ? v == s->value : s->kind == DT_WAIT_NE ? v != s->value
++                    : s->kind == DT_WAIT_GE ? v >= s->value : v < s->value;
++            if (hit) {
++                dt_event(frame, "hit\t%s\t%u", s->label, frame - dt.start_frame);
++                break;
++            }
++            if (frame - dt.start_frame >= s->n) {
++                dt_event(frame, "timeout\t%s\t%u", s->label, frame - dt.start_frame);
++                dt.failed = dt.finished = 1;
++                return;
++            }
++            return;
++        }
++        }
++        dt.step++;
++        dt.started = 0;
++    }
++    if (dt.has_script && !dt.finished) { dt.finished = 1; dt_event(frame, "script-end%s%.0u", "", 0); }
++}
++
++void difftrace_vblank(uint32_t frame)
++{
++    dt.last_frame = frame;
++    if (!dt.init) dt_init();
++    if (!dt.enabled) return;
++    const uint8_t *ram = dt.host.ram();
++    if (dt.has_script && !dt.failed) dt_advance(frame, ram);
++    if (dt.trace) {
++        uint16_t pad16 = (uint16_t)(dt.pad < 0 ? 0xFFFF : dt.pad), step16 = (uint16_t)dt.step;
++        uint32_t flags = (dt.has_script && !dt.finished ? 1u : 0u) | (dt.finished ? 2u : 0u) | (dt.failed ? 4u : 0u);
++        uint64_t hashes[DT_CHUNKS + 1];
++        for (uint32_t c = 0; c < DT_CHUNKS; c++)
++            hashes[c] = dt_hash(ram + (c << DT_CHUNK_SHIFT), 1u << DT_CHUNK_SHIFT);
++        uint8_t sp[1024];
++        if (dt.host.scratch_byte) for (uint32_t i = 0; i < 1024; i++) sp[i] = dt.host.scratch_byte(i);
++        else memset(sp, 0, sizeof sp);
++        hashes[DT_CHUNKS] = dt_hash(sp, sizeof sp);
++        fwrite(&frame, 4, 1, dt.trace);
++        fwrite(&pad16, 2, 1, dt.trace);
++        fwrite(&step16, 2, 1, dt.trace);
++        fwrite(&flags, 4, 1, dt.trace);
++        fwrite(hashes, 8, DT_CHUNKS + 1, dt.trace);
++        for (uint32_t i = 0; i < dt.n_regions; i++) fwrite(ram + dt.reg_addr[i], 1, dt.reg_len[i], dt.trace);
++        if ((frame & 63u) == 0) fflush(dt.trace);
++    }
++    if (dt.n_dump && dt_in(dt.dump, dt.n_dump, frame)) {
++        char p[1100];
++        snprintf(p, sizeof p, "%s.ram-%06u.bin", dt.trace_path[0] ? dt.trace_path : "difftrace", frame);
++        FILE *f = fopen(p, "wb");
++        if (f) { fwrite(ram, 1, DT_RAM_SIZE, f); fclose(f); }
++    }
++    if (dt.n_shot && dt.host.shot && dt_in(dt.shot, dt.n_shot, frame)) {
++        char p[1100];
++        snprintf(p, sizeof p, "%s/frame-%06u.png", dt.shot_dir, frame);
++        if (dt.host.shot(p) != 0) dt_event(frame, "shot-failed\t%s%.0u", p, 0);
++    }
++}
++
++int difftrace_pad(void)
++{
++    if (!dt.init) return -1;
++    return dt.enabled && dt.has_script ? dt.pad : -1;
++}
++
++int difftrace_active(void) { return dt.init && dt.enabled && dt.has_script; }
++int difftrace_finished(void) { return dt.init && dt.enabled && dt.finished; }
++
++#endif /* DIFFTRACE_IMPLEMENTATION */
++#endif /* T2_DIFFTRACE_H */
+diff --git a/runtime/src/interrupts.c b/runtime/src/interrupts.c
+index 25079682..4328e1cc 100644
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -184,6 +184,12 @@ void psx_irq_set_cause_ptr(uint32_t *p)
+  * exact guest cycle. */
+ void psx_irq_raise(uint32_t bit, uint32_t detail)
+ {
++    {   /* Tekken 2 differential trace (difftrace.h): IRQ raises in the PC and IO logs. */
++        extern int difftrace_pclog_on, difftrace_iolog_on;
++        extern void difftrace_irq(uint32_t bit, uint64_t tick);
++        if ((difftrace_pclog_on > 0 || difftrace_iolog_on) && !(i_stat & (1u << bit)))
++            difftrace_irq(bit, psx_get_cycle_count());
++    }
+     i_stat |= (1u << bit);
+     psx_irq_refresh_cause_ip2();
+     device_trace_note(bit, detail);
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index b052f987..53790bee 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -27,6 +27,10 @@
+ #include "psx_cycles.h"
+ #include "psx_icache.h"
+ #include "psx_memory.h"
++/* Tekken 2 differential trace IO log (difftrace.h, T2DIFF_IOLOG): GPUSTAT
++ * reads and GP1 writes. */
++extern int difftrace_iolog_on;
++void difftrace_io(char kind, uint32_t value, uint64_t tick);
+ #include "pgxp.h"
+ #include "render_pass.h"
+ #include "render_pass_plan.h"
+@@ -1327,7 +1331,12 @@ static uint32_t mmio_read32_impl(uint32_t addr) {
+     }
+     /* GPU: 0x1F801810 (GPUREAD), 0x1F801814 (GPUSTAT) */
+     if (addr == 0x1F801810u) return gpu_read_gpuread();
+-    if (addr == 0x1F801814u) return gpu_read_gpustat();
++    if (addr == 0x1F801814u) {
++        uint32_t v = gpu_read_gpustat();
++        /* Tekken 2 differential trace IO log (difftrace.h, T2DIFF_IOLOG). */
++        if (difftrace_iolog_on) difftrace_io('S', v, psx_get_cycle_count());
++        return v;
++    }
+     /* MDEC: 0x1F801820, 0x1F801824 */
+     if (addr == 0x1F801820u || addr == 0x1F801824u) return mdec_read(addr);
+     /* SPU: 0x1F801C00..0x1F801FFF */
+@@ -1405,7 +1414,11 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
+         gpu_write_gp0(val);
+         return;
+     }
+-    if (addr == 0x1F801814u) { gpu_write_gp1(val); return; }
++    if (addr == 0x1F801814u) {
++        if (difftrace_iolog_on) difftrace_io('G', val, psx_get_cycle_count());
++        gpu_write_gp1(val);
++        return;
++    }
+     /* MDEC: 0x1F801820, 0x1F801824 */
+     if (addr == 0x1F801820u || addr == 0x1F801824u) { mdec_write(addr, val); return; }
+     /* SPU: 0x1F801C00..0x1F801FFF */
+diff --git a/runtime/src/sio.c b/runtime/src/sio.c
+index 5050118a..69e4d2ee 100644
+--- a/runtime/src/sio.c
++++ b/runtime/src/sio.c
+@@ -2195,6 +2195,13 @@ static void sio_process_byte(uint8_t tx_byte) {
+     }
+ }
+ 
++/* Tekken 2 differential trace IO log (difftrace.h, T2DIFF_IOLOG). */
++extern int difftrace_iolog_on;
++void difftrace_io(char kind, uint32_t value, uint64_t tick);
++extern uint64_t psx_get_cycle_count(void);
++#define T2DIFF_IO(kind, value) \
++    do { if (difftrace_iolog_on) difftrace_io((kind), (uint32_t)(value), psx_get_cycle_count()); } while (0)
++
+ uint32_t sio_read(uint32_t addr) {
+     sio_debug_poll_maybe();
+ 
+@@ -2220,6 +2227,7 @@ uint32_t sio_read(uint32_t addr) {
+             card_data_writes_arm(b, (uint16_t)mc_state,
+                                  mc_data_idx, (uint8_t)mc_slot);
+         }
++        T2DIFF_IO('j', b);
+         return b;
+     }
+ 
+@@ -2233,6 +2241,7 @@ uint32_t sio_read(uint32_t addr) {
+         if (sio_ack_visible_reads > 0 && --sio_ack_visible_reads == 0) {
+             sio_stat &= ~SIO_STAT_ACK;
+         }
++        T2DIFF_IO('s', observed);
+         return observed;
+     }
+ 
+@@ -2274,6 +2283,11 @@ void sio_write(uint32_t addr, uint32_t value) {
+     /* Capture writing PC (set by recompiler before every store) into the
+      * SIO PC tracer ring before the write actually takes effect. */
+     debug_server_log_sio_write(addr, value, 4);
++    if (difftrace_iolog_on) {
++        const char k = addr == 0x1F801040u ? 'J' : addr == 0x1F80104Au ? 'C'
++                     : addr == 0x1F801048u ? 'M' : addr == 0x1F80104Eu ? 'B' : 0;
++        if (k) T2DIFF_IO(k, addr == 0x1F801040u ? (value & 0xFFu) : (value & 0xFFFFu));
++    }
+ 
+     switch (addr) {
+     case 0x1F801040: /* SIO_TX_DATA */

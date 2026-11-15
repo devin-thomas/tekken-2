@@ -1,0 +1,129 @@
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index 8aec7828..8d97d4b3 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -2420,6 +2420,56 @@ static void color_self_barrier(VkCommandBuffer cb, VkImage img) {
+         0, 0, NULL, 0, NULL, 1, &barrier);
+ }
+ 
++/* Tekken 2 patch 0016: the render area of each VRAM pass. Every textured or
++ * untextured batch used to open a render pass over the whole 1024x512 VRAM
++ * image. On a tiling GPU (the Galaxy S21 Ultra's Adreno 660) LOAD/STORE then
++ * moves the full colour and stencil attachments through tile memory for every
++ * batch, whatever the batch draws. Tekken 2's Quick Select player select
++ * breaks into ~108 batches a frame (opaque portraits and semi-transparent
++ * frames alternate), against 4-10 in a fight, so the GPU spent ~19 ms a frame
++ * on attachment traffic and the game fell to 39-46 Hz. A batch's pass now
++ * covers only its bounding box (Vulkan leaves pixels outside renderArea
++ * untouched), and the scissor is clipped to it. */
++static int s_pass_x0, s_pass_y0, s_pass_x1, s_pass_y1;   /* native px, inclusive */
++
++static void begin_geo_pass(VkCommandBuffer cb);
++static void begin_geo_pass_area(VkCommandBuffer cb, int x0, int y0, int x1, int y1) {
++    static int full = -1;   /* PSX_VK_FULL_PASS=1: the old whole-VRAM passes, for A/B checks */
++    if (full < 0) { const char *e = getenv("PSX_VK_FULL_PASS"); full = (e && *e == '1'); }
++    if (full) { begin_geo_pass(cb); return; }
++    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
++    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1; if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
++    if (x1 < x0 || y1 < y0) { x0 = y0 = 0; x1 = y1 = 0; }
++    /* Round out to 16 native px: cheap, and friendlier to tile grids. */
++    x0 &= ~15; y0 &= ~15;
++    x1 |= 15; y1 |= 15;
++    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1; if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
++    s_pass_x0 = x0; s_pass_y0 = y0; s_pass_x1 = x1; s_pass_y1 = y1;
++    VkImageMemoryBarrier db = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++    db.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++    db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++    db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    db.image = s_ds_img;
++    db.subresourceRange.aspectMask = DS_ASPECT;
++    db.subresourceRange.levelCount = 1;
++    db.subresourceRange.layerCount = 1;
++    db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
++                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    p_vkCmdPipelineBarrier(cb,
++        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++        0, 0, NULL, 0, NULL, 1, &db);
++    color_self_barrier(cb, s_vram_img);
++    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
++    rp.renderPass = s_rpass; rp.framebuffer = s_fbo;
++    rp.renderArea.offset.x = x0 * s_scale;
++    rp.renderArea.offset.y = y0 * s_scale;
++    rp.renderArea.extent.width = (uint32_t)((x1 - x0 + 1) * s_scale);
++    rp.renderArea.extent.height = (uint32_t)((y1 - y0 + 1) * s_scale);
++    p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
++}
++
+ static void begin_geo_pass(VkCommandBuffer cb) {
+     /* Explicit stencil ordering across one-shot submits: this pass both TESTS
+      * and WRITES the stencil (PSX mask bits) that a PRIOR submit's pass wrote.
+@@ -2449,6 +2499,7 @@ static void begin_geo_pass(VkCommandBuffer cb) {
+     rp.renderPass = s_rpass; rp.framebuffer = s_fbo;
+     rp.renderArea.extent.width = VRAM_W * s_scale;
+     rp.renderArea.extent.height = VRAM_H * s_scale;
++    s_pass_x0 = 0; s_pass_y0 = 0; s_pass_x1 = VRAM_W - 1; s_pass_y1 = VRAM_H - 1;
+     p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+ }
+ /* Bind a graphics pipeline implementing GL's mask_stencil: check==0 -> SET
+@@ -2582,7 +2633,7 @@ static void blit_region(int x, int y, int w, int h, VkImageView src_view,
+     VkCommandBuffer cb = begin_oneshot();
+     img_to(cb, src_img, src_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-    begin_geo_pass(cb);
++    begin_geo_pass_area(cb, x, y, x + w - 1, y + h - 1);   /* patch 0016 */
+     set_vp_full(cb); set_scissor_px(cb, x, y, w, h);
+     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_blit, 0, 1, &ds, 0, NULL);
+     BlitPush bp = {0};
+@@ -2985,6 +3036,9 @@ static void set_vp_scissor(VkCommandBuffer cb) {
+     int x1 = s_da_x1 < 0 ? 0 : s_da_x1, y1 = s_da_y1 < 0 ? 0 : s_da_y1;
+     int x2 = s_da_x2 >= VRAM_W ? VRAM_W - 1 : s_da_x2;
+     int y2 = s_da_y2 >= VRAM_H ? VRAM_H - 1 : s_da_y2;
++    /* patch 0016: never draw outside the pass's render area */
++    if (x1 < s_pass_x0) x1 = s_pass_x0; if (y1 < s_pass_y0) y1 = s_pass_y0;
++    if (x2 > s_pass_x1) x2 = s_pass_x1; if (y2 > s_pass_y1) y2 = s_pass_y1;
+     int w = x2 - x1 + 1, h = y2 - y1 + 1;
+     if (w < 0) w = 0; if (h < 0) h = 0;
+     VkRect2D sc = { { x1 * S, y1 * S }, { (uint32_t)(w * S), (uint32_t)(h * S) } };
+@@ -3128,7 +3182,10 @@ static void flush_geometry(void) {
+     int semi = s_geo_semi, blend = (semi < 0) ? 0 : (semi + 1);
+     VkCommandBuffer cb = begin_oneshot();
+     vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-    begin_geo_pass(cb);
++    if (s_geo_bbox.set)   /* patch 0016: the batch's own box (+1 px for edge rules) */
++        begin_geo_pass_area(cb, s_geo_bbox.x0 - 1, s_geo_bbox.y0 - 1, s_geo_bbox.x1 + 1, s_geo_bbox.y1 + 1);
++    else
++        begin_geo_pass(cb);
+     set_vp_scissor(cb);
+     bind_masked(cb, 0, 0, blend, s_geo_check, s_geo_mask);
+     GeoPush gp = { px_shift(), 0.0f, 512.0f };
+@@ -3340,6 +3397,7 @@ static void vkb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
+  * semi-transparent texels with PS1 blending). Per-prim texture state rode in the
+  * vertex; the batch keys (semi/mask/twin/filter) drive the push constants and
+  * pipeline. The raw mirror was made coherent at append time (flush_pack_if_sampling). */
++static DirtyRect s_tb_bbox;   /* patch 0016: box of the open textured batch */
+ static void flush_tex_batch(void) {
+     if (s_tcount == 0 || !s_ready) return;
+     s_perf_cur.tex_flushes++;
+@@ -3349,7 +3407,11 @@ static void flush_tex_batch(void) {
+     VkCommandBuffer cb = begin_oneshot();
+     img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-    begin_geo_pass(cb);
++    if (s_tb_bbox.set)
++        begin_geo_pass_area(cb, s_tb_bbox.x0 - 1, s_tb_bbox.y0 - 1, s_tb_bbox.x1 + 1, s_tb_bbox.y1 + 1);
++    else
++        begin_geo_pass(cb);
++    rect_clear(&s_tb_bbox);
+     set_vp_scissor(cb);
+     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
+     VkDeviceSize off = 0;
+@@ -3495,6 +3557,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
+     if (bx0 < s_da_x1) bx0 = s_da_x1; if (by0 < s_da_y1) by0 = s_da_y1;
+     if (bx1 > s_da_x2) bx1 = s_da_x2; if (by1 > s_da_y2) by1 = s_da_y2;
+     rect_add(&s_pack_dirty, bx0, by0, bx1, by1);
++    rect_add(&s_tb_bbox, bx0, by0, bx1, by1);
+     s_gpu_dirty = 1;
+ }
+ 

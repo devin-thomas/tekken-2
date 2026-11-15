@@ -1,0 +1,238 @@
+Subject: [PATCH] Reclassify configured addresses as data (data_funcs, data_ranges)
+
+Tekken 2's game.toml lists three ranges of its text segment that hold
+tables, not code ([recompiler] data_ranges), because data words there
+decode as JAL and seed false functions. psxrecomp does not read those keys,
+so this patch adds them:
+
+- [recompiler] data_funcs (addresses) and data_ranges (half-open
+  [start, end) pairs) in config_loader.
+- psxrecomp-game marks every function starting inside them as data after
+  each discovery pass and never promotes a candidate entry inside them.
+- A data function is emitted as a fail-closed psx_unknown_dispatch stub,
+  before alias grouping, so a data host gets no alias group, its aliases
+  are not materialized and its CFG is empty.
+
+Applied last, so patches 0001-0021 apply to upstream psxrecomp unchanged.
+
+---
+diff --git a/recompiler/src/code_generator.cpp b/recompiler/src/code_generator.cpp
+index 6b539ed5..a80fdb75 100644
+--- a/recompiler/src/code_generator.cpp
++++ b/recompiler/src/code_generator.cpp
+@@ -3845,15 +3845,30 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
+     // not as per-alias duplicates of the host's blocks.
+     std::map<uint32_t, std::vector<const Function*>> alias_groups;
+     for (const Function& f : functions) {
+-        if (f.alias_walk_lo != 0) alias_groups[f.alias_walk_lo].push_back(&f);
++        if (f.alias_walk_lo != 0 && !f.is_data_section) alias_groups[f.alias_walk_lo].push_back(&f);
+     }
+     std::set<uint32_t> alias_groups_emitted;
+ 
+     int total_lines = 0;
+ 
+     for (const Function& func : functions) {
++        if (func.is_data_section) {
++            GeneratedFunction stub;
++            stub.function_name = func.name;
++            stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
++            stub.body = fmt::format(
++                "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",
++                runtime_pc(func.start_addr), func.start_addr & 0x1FFFFFFFu);
++            stub.full_code = stub.signature + "\n" + stub.body;
++            stub.line_count = 4;
++            stub.dispatchable = false;
++            results.push_back(stub);
++            continue;
++        }
++
+         if (func.alias_walk_lo != 0) {
+             if (!alias_groups_emitted.insert(func.alias_walk_lo).second) continue;
++            if (alias_groups.find(func.alias_walk_lo) == alias_groups.end()) continue;
+             const auto& group = alias_groups.at(func.alias_walk_lo);
+             if (cfgs.count(func.start_addr) == 0) continue;
+             const ControlFlowGraph& cfg = cfgs.at(func.start_addr);
+@@ -3870,19 +3885,6 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
+             }
+             continue;
+         }
+-        if (func.is_data_section) {
+-            GeneratedFunction stub;
+-            stub.function_name = func.name;
+-            stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+-            stub.body = fmt::format(
+-                "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",
+-                runtime_pc(func.start_addr), func.start_addr & 0x1FFFFFFFu);
+-            stub.full_code = stub.signature + "\n" + stub.body;
+-            stub.line_count = 4;
+-            stub.dispatchable = false;
+-            results.push_back(stub);
+-            continue;
+-        }
+ 
+         if (cfgs.count(func.start_addr) == 0) {
+             continue; // Skip if no CFG
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index ea413b55..e0e7fe56 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -2161,6 +2161,26 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+         }
+     }
+ 
++    std::vector<uint32_t> data_funcs;
++    if (recomp.contains("data_funcs")) {
++        for (const auto& item : toml::find<std::vector<std::string>>(recomp, "data_funcs")) {
++            data_funcs.push_back(parse_hex(item, "recompiler.data_funcs"));
++        }
++    }
++
++    std::vector<std::pair<uint32_t, uint32_t>> data_ranges;
++    if (recomp.contains("data_ranges")) {
++        for (const auto& item : toml::find<toml::array>(recomp, "data_ranges")) {
++            const auto& arr = toml::get<std::vector<std::string>>(item);
++            if (arr.size() != 2) {
++                throw std::runtime_error("[recompiler] data_ranges entries must be [start, end] pairs");
++            }
++            uint32_t start = parse_hex(arr[0], "recompiler.data_ranges.start");
++            uint32_t end = parse_hex(arr[1], "recompiler.data_ranges.end");
++            data_ranges.emplace_back(start, end);
++        }
++    }
++
+     // Optional [widescreen] block — per-game hooks for the widescreen hack.
+     std::vector<uint32_t> ws_sprite_tag_funcs;
+     uint32_t ws_sprite_anchor_addr = 0;
+@@ -3127,6 +3147,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+         parse_draw_distance_clamps(cfg, config_path);
+     reject_quality_presets(cfg, config_path);
+     loaded.mod_immediate_sites = parse_mod_immediate_sites(cfg, config_path);
++    loaded.data_funcs = std::move(data_funcs);
++    loaded.data_ranges = std::move(data_ranges);
+     return loaded;
+ }
+ 
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index c44faf3f..4f78c2c9 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1555,6 +1555,10 @@ struct GameConfig {
+     std::vector<ModImmediateSite> mod_immediate_sites;
+     // Guarded SLTU on SX<<16 against screen width<<16; both wide edges.
+     std::vector<WidescreenPackedXSite> ws_cull_packed_x_sites;
++    // [recompiler] data_funcs: guest addresses reclassified as data (fail-closed stubs)
++    std::vector<uint32_t> data_funcs;
++    // [recompiler] data_ranges: half-open address ranges [start, end) reclassified as data
++    std::vector<std::pair<uint32_t, uint32_t>> data_ranges;
+ };
+ 
+ // Effective clip_edge_width: explicit value, else screen_w_imms[0], else 320.
+diff --git a/recompiler/src/control_flow.cpp b/recompiler/src/control_flow.cpp
+index 664f334a..2e1181e2 100644
+--- a/recompiler/src/control_flow.cpp
++++ b/recompiler/src/control_flow.cpp
+@@ -473,6 +473,11 @@ void rebuild_control_flow_metadata(
+ 
+ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
+     ControlFlowGraph cfg;
++    if (func.is_data_section) {
++        cfg.function_start = func.start_addr;
++        cfg.function_end = func.end_addr;
++        return cfg;
++    }
+     // Alias entries cover their HOST's full range so backward branches, shared
+     // epilogues, and jr jump tables (whose setup may precede the alias entry)
+     // all stay intra-function. The emitted alias enters via goto to its
+diff --git a/recompiler/src/main_psx.cpp b/recompiler/src/main_psx.cpp
+index 51519c7a..74fd5840 100644
+--- a/recompiler/src/main_psx.cpp
++++ b/recompiler/src/main_psx.cpp
+@@ -55,15 +55,18 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
+         by_host[ae.host_start].push_back(&ae);
+     }
+     for (const auto& [host_start, group] : by_host) {
++        bool host_is_data = false;
+         uint32_t producer_lo = 0;
+         uint32_t producer_hi = 0;
+         for (const auto& function : result.functions) {
+             if (function.start_addr == host_start) {
++                if (function.is_data_section) host_is_data = true;
+                 producer_lo = function.producer_lo;
+                 producer_hi = function.producer_hi;
+                 break;
+             }
+         }
++        if (host_is_data) continue;
+         std::vector<uint32_t> entries;
+         for (const AliasEntry* ae : group) entries.push_back(ae->addr);
+         for (const AliasEntry* ae : group) {
+@@ -275,9 +278,13 @@ static int psxrecomp_game_main(int argc, char** argv) {
+     std::filesystem::path out_dir = "generated";
+     uint32_t              configured_text_size = 0;
+     std::filesystem::path bios_profile_path;   // [recompiler] bios_config
++    std::vector<uint32_t> data_funcs;
++    std::vector<std::pair<uint32_t, uint32_t>> data_ranges;
+ 
+     if (!config_path.empty()) {
+         const auto cfg = PSXRecompV4::load_game_config(config_path);
++        data_funcs           = cfg.data_funcs;
++        data_ranges          = cfg.data_ranges;
+         exe_path             = cfg.exe_path;
+         configured_text_size = cfg.text_size;
+         reachable_discovery  = cfg.discovery == "reachable";
+@@ -1343,11 +1350,27 @@ static int psxrecomp_game_main(int argc, char** argv) {
+             return w.has_value() ? *w : 0u;
+         };
+ 
++        auto is_in_data = [&](uint32_t a) {
++            if (std::find(data_funcs.begin(), data_funcs.end(), a) != data_funcs.end()) return true;
++            for (const auto& r : data_ranges) {
++                if (a >= r.first && a < r.second) return true;
++            }
++            return false;
++        };
++        auto apply_data_classification = [&](PSXRecomp::FunctionAnalysisResult& res) {
++            for (auto& func : res.functions) {
++                if (is_in_data(func.start_addr)) {
++                    func.is_data_section = true;
++                }
++            }
++        };
++
+         const int kMaxDiscoveryIters = 6;
+         for (int iter = 0; iter < kMaxDiscoveryIters; ++iter) {
+             PSXRecomp::FunctionAnalyzer analyzer(*exe);
+             for (uint32_t a : forced) analyzer.add_forced_entry(a);
+             analysis_result = analyzer.analyze();
++            apply_data_classification(analysis_result);
+ 
+             std::vector<const PSXRecomp::Function*> code_funcs;
+             for (const auto& f : analysis_result.functions) {
+@@ -1389,6 +1412,7 @@ static int psxrecomp_game_main(int argc, char** argv) {
+             bool promoted_new = false;
+             for (const auto& [a, trusted, table_evidence] : candidates) {
+                 if ((a & 3u) || a < exe_lo || a >= exe_hi) continue;
++                if (is_in_data(a)) continue;
+                 const PSXRecomp::Function* host = containing(a);
+                 if (host && a == host->start_addr) continue;  // already an entry
+                 uint32_t w = read_w(a);
+@@ -1428,6 +1452,19 @@ static int psxrecomp_game_main(int argc, char** argv) {
+     fmt::print("Code Coverage:   {} KB analyzed\n",
+                (exe->end_address() - exe->header.load_address) / 1024);
+ 
++    // Reclassify functions specified in data_funcs / data_ranges as data
++    for (auto& func : analysis_result.functions) {
++        if (std::find(data_funcs.begin(), data_funcs.end(), func.start_addr) != data_funcs.end()) {
++            func.is_data_section = true;
++        }
++        for (const auto& range : data_ranges) {
++            if (func.start_addr >= range.first && func.start_addr < range.second) {
++                func.is_data_section = true;
++                break;
++            }
++        }
++    }
++
+     // Count functions with prologues/epilogues
+     int with_prologue = 0;
+     int with_epilogue = 0;

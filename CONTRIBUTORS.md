@@ -1,0 +1,12 @@
+# Contributors
+
+Tekken 2 Recompiled's own code is by the contributors named here, each by
+the name they want credited:
+
+- Lil Gohan (Twitter: https://twitter.com/gohan__FGC, https://fgc.lilgohan.com)
+
+Someone becomes a contributor only by being added to this list. AI tools and
+coding agents used to develop the project are tools, not contributors or
+copyright holders, whatever name or account a commit made with them carries.
+
+Third-party code keeps its own authors and licences; `release/CREDITS.txt` lists them.

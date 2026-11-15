@@ -1,0 +1,375 @@
+diff --git a/runtime/include/psx_cyc.h b/runtime/include/psx_cyc.h
+index 917795df..a43d582c 100644
+--- a/runtime/include/psx_cyc.h
++++ b/runtime/include/psx_cyc.h
+@@ -200,8 +200,30 @@ static inline void psx_cyc_charge(uint32_t cycles) {
+ #endif
+ }
+ 
++/* DuckStation CPU cost model (Tekken 2 patch 0011). The Beetle model above
++ * charges a load its fudge, region wait and completion with a give-back, an
++ * I-cache refill per missed line, and mult/div stalls. DuckStation ffb33c28's
++ * recompiler, the reference the differential test runs against
++ * (recomp/tools/diff), charges one cycle an instruction, a
++ * main-RAM load 6 more with nothing given back, the BIOS ROM and devices
++ * their access time, an uncached fetch the ROM word time or a RAM read, and
++ * nothing for cached fetches or mult/div. Tekken 2 measured against it: OpenBIOS
++ * reached its shell 11,294 cycles late under Beetle (the shell's interlace
++ * switch then fell after a field wrap and the intro ran one field short), its
++ * LZ decompressor ran 12 cycles a byte against 13, and the game's start-up
++ * drifted 0.05 frame across a VBlank. On in REFERENCE builds, off in ENHANCED;
++ * PSX_CPU_COST=duckstation|beetle overrides (memory.c). */
++extern int g_psx_cpu_cost_ds;
++int psx_cpu_cost_ds_resolve(void);
++#define PSX_DS_RAM_READ_CYCLES 6u
++static inline int psx_cpu_cost_ds(void) {
++    if (g_psx_cpu_cost_ds < 0) return psx_cpu_cost_ds_resolve();
++    return g_psx_cpu_cost_ds;
++}
++
+ /* §1 base (Beetle cpu.cpp:795-798). */
+ static inline void psx_cyc_base(CPUState* cpu) {
++    if (psx_cpu_cost_ds()) { psx_cyc_charge(1u); return; }
+     uint8_t w = cpu->read_absorb_which;
+     if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
+     else                     psx_cyc_charge(1u);
+@@ -286,7 +308,9 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
+     uint32_t phys = addr & 0x1FFFFFFFu;
+     if (addr < 0xC0000000u && g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+-        if (g_psx_load_delay) {
++        if (psx_cpu_cost_ds()) {
++            psx_cyc_charge(1u + PSX_DS_RAM_READ_CYCLES);
++        } else if (g_psx_load_delay) {
+             psx_cyc_base(cpu);
+             psx_cyc_deps(cpu, reg_mask);
+             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+@@ -316,7 +340,9 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
+     uint32_t phys = addr & 0x1FFFFFFFu;
+     if (addr < 0xC0000000u && g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+-        if (g_psx_load_delay) {
++        if (psx_cpu_cost_ds()) {
++            psx_cyc_charge(1u + PSX_DS_RAM_READ_CYCLES);
++        } else if (g_psx_load_delay) {
+             psx_cyc_base(cpu);
+             psx_cyc_deps(cpu, reg_mask);
+             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+diff --git a/runtime/include/sio_timing.h b/runtime/include/sio_timing.h
+new file mode 100644
+index 00000000..8328a1be
+--- /dev/null
++++ b/runtime/include/sio_timing.h
+@@ -0,0 +1,46 @@
++#ifndef PSXRECOMP_SIO_TIMING_H
++#define PSXRECOMP_SIO_TIMING_H
++
++/* SIO0 byte and /ACK timing on the DuckStation reference (Tekken 2 patch 0011).
++ *
++ * A byte on the controller/memory card port shifts out at the JOY_BAUD rate:
++ * 8 bits at the reload value each, JOY_BAUD x 8 CPU cycles (PSX-SPX
++ * "Controller and Memory Card I/O Ports": 1F80104Eh, BIOS value 0088h, so
++ * 1,088). The device's /ACK pulse then arrives after a device-specific delay
++ * (PSX-SPX: "about 10us" for joypads; memory cards answer sooner). Measured on
++ * DuckStation ffb33c28 with Tekken 2 (difftrace IO log, tools/diff): the IRQ7
++ * of a pad byte comes 1,538 cycles after the JOY_DATA write (1,088 + 450), a
++ * memory card byte's 1,258 (1,088 + 170), RX data ready 1,088 after the write
++ * on both. psxrecomp gave every device 1,088 + 170 and ignored JOY_BAUD.
++ *
++ * On in REFERENCE builds, off in ENHANCED; PSX_SIO_TIMING=1/0 overrides
++ * (sio.c). */
++
++#include "execution_profile.h"
++
++#include <stdint.h>
++
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define SIO_TIMING_DEFAULT 1
++#else
++#define SIO_TIMING_DEFAULT 0
++#endif
++
++#define SIO_LEGACY_TRANSFER_CYCLES 1088u
++#define SIO_LEGACY_ACK_CYCLES      170u
++#define SIO_PAD_ACK_CYCLES         450u
++#define SIO_CARD_ACK_CYCLES        170u
++
++/* Cycles a byte takes to shift, from JOY_BAUD (0 falls back to the BIOS rate). */
++static inline uint32_t sio_timing_transfer_cycles(int on, uint16_t baud) {
++    if (!on || baud == 0u) return SIO_LEGACY_TRANSFER_CYCLES;
++    return (uint32_t)baud * 8u;
++}
++
++/* Cycles from the end of a byte to the device's /ACK (and IRQ7). */
++static inline uint32_t sio_timing_ack_cycles(int on, int memory_card) {
++    if (!on) return SIO_LEGACY_ACK_CYCLES;
++    return memory_card ? SIO_CARD_ACK_CYCLES : SIO_PAD_ACK_CYCLES;
++}
++
++#endif
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 4e613731..256027b6 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -700,6 +700,13 @@ else()
+     endif()
+ endif()
+ 
++# SIO0 byte and /ACK timing (Tekken 2 patch 0011).
++if(BUILD_TESTING AND NOT TARGET sio_timing_test)
++    add_executable(sio_timing_test ${PSXRECOMP_ROOT}/runtime/tests/test_sio_timing.c)
++    target_include_directories(sio_timing_test PRIVATE ${PSXRECOMP_ROOT}/runtime/include)
++    add_test(NAME sio_timing_test COMMAND sio_timing_test)
++endif()
++
+ # OpenGL textured-batch grouping tier (runtime/src/gl_batch_policy.h;
+ # recomp-template HLE.md). LLE, the reference, draws every semi-transparent
+ # primitive alone. HLE draws painter-ordered runs of opaque primitives and
+diff --git a/runtime/src/interrupts.c b/runtime/src/interrupts.c
+index 196b87c5..8135083c 100644
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -42,6 +42,7 @@
+ #include "psx_cycle_freeze.h"
+ #include "psx_scheduler.h"
+ #include "psx_video_timing.h"
++#include "execution_profile.h"
+ #include "spu.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -603,6 +604,30 @@ extern uint64_t g_vblank_ack_count;   /* defined in memory.c */
+ #define POST_EXC_CLAIMED_COOLDOWN_CYCLES   128u   /* claimed non-SIO: a few blocks */
+ #define POST_EXC_UNCLAIMED_COOLDOWN_CYCLES 8192u  /* unclaimed: generous boot window */
+ 
++/* Hardware interrupt latency (Tekken 2 patch 0011). The R3000A takes a pending,
++ * enabled interrupt at the next instruction after the handler's RFE; there is
++ * no cooldown. The "unclaimed" test above misfires when a device raises the
++ * same bit again while its handler runs: OpenBIOS's memory card handler sends
++ * the next byte and returns ~1,400 cycles later, after that byte's IRQ7 has
++ * come (1,258 cycles), so I_STAT at the exit equals I_STAT at the entry and
++ * every card byte waited 8,192 cycles for its interrupt. Tekken 2's card reads
++ * ran a byte per 10,300 cycles where DuckStation ffb33c28 runs one per 1,760
++ * (difftrace IO log). On in REFERENCE builds, off in ENHANCED;
++ * PSX_IRQ_HW_LATENCY=1/0 overrides. */
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define IRQ_HW_LATENCY_DEFAULT 1
++#else
++#define IRQ_HW_LATENCY_DEFAULT 0
++#endif
++static int irq_hw_latency_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("PSX_IRQ_HW_LATENCY");
++        on = (e && *e) ? (e[0] == '1') : IRQ_HW_LATENCY_DEFAULT;
++    }
++    return on;
++}
++
+ /* setjmp target for ReturnFromException during handler dispatch.
+  *
+  * IMPORTANT: longjmp(exception_jmpbuf, ...) MUST execute on the same
+@@ -2161,7 +2186,10 @@ irq_deliver_eval:
+      * executes at least one instruction between exceptions; in our model
+      * each "block" is many instructions, but the handler also consumes
+      * hundreds of sub-dispatches per invocation. */
+-    if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
++    if (irq_hw_latency_on()) {
++        /* Hardware: no cooldown (irq_hw_latency_on above). */
++        post_exception_cooldown_until = 0;
++    } else if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
+         /* unclaimed: give main code guest-time to install handlers */
+         post_exception_cooldown_until = psx_get_cycle_count() + POST_EXC_UNCLAIMED_COOLDOWN_CYCLES;
+     } else {
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index 2b11dd00..d5df23d9 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -188,6 +188,22 @@ uint32_t psx_gpu_packet_key(uint32_t address) {
+ uint8_t *g_psx_ram = ram;
+ /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
+ int g_psx_load_delay = -1;
++/* CPU cost model (Tekken 2 patch 0011, psx_cyc.h): DuckStation's in
++ * REFERENCE builds, Beetle's in ENHANCED; PSX_CPU_COST=duckstation|beetle
++ * overrides. */
++#if defined(PSX_EXECUTION_PROFILE_CONFIG) && !PSX_EXECUTION_ENHANCED
++#define PSX_CPU_COST_DS_DEFAULT 1
++#else
++#define PSX_CPU_COST_DS_DEFAULT 0
++#endif
++int g_psx_cpu_cost_ds = -1;
++int psx_cpu_cost_ds_resolve(void) {
++    if (g_psx_cpu_cost_ds < 0) {
++        const char *e = getenv("PSX_CPU_COST");
++        g_psx_cpu_cost_ds = (e && *e) ? (e[0] == 'd' || e[0] == 'D') : PSX_CPU_COST_DS_DEFAULT;
++    }
++    return g_psx_cpu_cost_ds;
++}
+ 
+ /* Physical address translation for guest accesses. Retail 2 MB DRAM is
+  * mirrored across the first 8 MB of each segment (Kula World's crt0 parks $sp
+@@ -2476,6 +2492,21 @@ static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
+  * 0x20 = none (LWC2, dest is a GTE reg). size = access width in bytes (1/2/4). */
+ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
+                                    uint32_t compl_cost, uint32_t arm_rt) {
++    if (psx_cpu_cost_ds()) {
++        /* DuckStation: RAM +6, BIOS ROM its access time, scratchpad free,
++         * devices their wait; no fudge, completion or give-back. */
++        cpu->ld_absorb = 0u;
++        cpu->ld_which_t = 0x20u;
++        (void)compl_cost; (void)arm_rt;
++        if (phys < 0x00800000u) { psx_cpu_charge(PSX_DS_RAM_READ_CYCLES); return; }
++        if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) return;
++        if (psx_rom_timing_enabled() && phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu) {
++            psx_cpu_charge(g_psx_rom_access[size >= 4u ? 2 : size == 2u ? 1 : 0]);
++            return;
++        }
++        psx_cpu_charge(psx_mmio_read_wait(phys, size));
++        return;
++    }
+     /* ReadMemory start (369-370): clear the current give-back slot. */
+     cpu->read_absorb[cpu->read_absorb_which] = 0u;
+     cpu->read_absorb_which = 0u;
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index 20fa2ddd..2c80e5e0 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -1061,6 +1061,7 @@ void psx_muldiv_set(CPUState* cpu, uint32_t latency) {
+ }
+ 
+ void psx_muldiv_stall(CPUState* cpu) {
++    if (psx_cpu_cost_ds()) return;   /* DuckStation recompiler: no mult/div stall */
+     /* Publish once before comparing; otherwise advance would add the pending
+      * work a second time on top of a stall computed from a stale clock. */
+     psx_cyc_batch_flush();
+diff --git a/runtime/src/psx_icache.c b/runtime/src/psx_icache.c
+index 463468cc..7cf0c58f 100644
+--- a/runtime/src/psx_icache.c
++++ b/runtime/src/psx_icache.c
+@@ -78,6 +78,14 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
+ #ifdef PSX_ENABLE_BLOCK_CYCLES
+     if (g_psx_icache_active < 0) g_psx_icache_active = psx_icache_enabled();
+     if (!g_psx_icache_active) return;
++    if (psx_cpu_cost_ds()) {
++        /* DuckStation recompiler: cached code has no refill cost; an uncached
++         * fetch costs the ROM word time or a RAM read. */
++        if (psx_fetch_uncached(addr))
++            psx_cpu_charge((psx_is_bios_rom(addr) && psx_rom_timing_enabled())
++                           ? g_psx_rom_access[2] : PSX_DS_RAM_READ_CYCLES);
++        return;
++    }
+     uint32_t idx = (addr & 0xFFCu) >> 2;
+     if (g_psx_icache_tv[idx] == addr) return;        /* HIT: +0, no give-back clear */
+ 
+diff --git a/runtime/src/sio.c b/runtime/src/sio.c
+index 69e4d2ee..1c4d4fb7 100644
+--- a/runtime/src/sio.c
++++ b/runtime/src/sio.c
+@@ -19,6 +19,7 @@
+ #include "memcard.h"
+ #include "debug_server.h"
+ #include "event_ring.h"
++#include "sio_timing.h"
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -575,6 +576,19 @@ volatile int g_sio_timing_active = 0;
+ #if SIO_MODEL_CYCLE_PACED
+ #define SIO_BAUD_CYCLES_DEFAULT 1088
+ #define SIO_ACK_CYCLES_DEFAULT  170
++/* Byte and /ACK time from JOY_BAUD and the answering device (sio_timing.h,
++ * Tekken 2 patch 0011): on in REFERENCE, PSX_SIO_TIMING=1/0 overrides. */
++static int sio_timing_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("PSX_SIO_TIMING");
++        on = (e && *e) ? (e[0] == '1') : SIO_TIMING_DEFAULT;
++    }
++    return on;
++}
++static int sio_transfer_cycles(void) {
++    return (int)sio_timing_transfer_cycles(sio_timing_on(), sio_baud);
++}
+ static int sio_tick_quantum_cycles = 64;
+ static int     sio_shift_active     = 0;
+ static uint8_t sio_shift_byte       = 0;
+@@ -2404,7 +2418,7 @@ void sio_write(uint32_t addr, uint32_t value) {
+             if (!sio_shift_active) {
+                 sio_shift_byte      = b;
+                 sio_shift_active    = 1;
+-                sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
++                sio_shift_remaining = sio_transfer_cycles();
+                 sio_shift_ack_irq_en = (sio_ctrl & SIO_CTRL_ACK_IRQ_EN) ? 1 : 0;
+                 sio_stat &= ~(SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
+                 g_sio_timing_active = 1;
+@@ -2821,20 +2835,21 @@ static void sio_handle_shift_complete(void) {
+     sio_irq_pending_source   = (active_device == DEV_MEMCARD)
+                                ? SIO_IRQ_SRC_CARD_ACK : SIO_IRQ_SRC_PAD_ACK;
+     sio_irq_pending_slot     = (uint8_t)selected_slot;
+-    sio_irq_pending_delay    = (uint8_t)SIO_ACK_CYCLES_DEFAULT;
++    const int ack_cycles = (int)sio_timing_ack_cycles(sio_timing_on(), active_device == DEV_MEMCARD);
++    sio_irq_pending_delay    = (uint8_t)(ack_cycles > 255 ? 255 : ack_cycles);
+     sio_irq_pending_mc_state = (uint8_t)mc_state;
+     sio_irq_pending_byte_seq = sio_trace_seq;
+ 
+     if (acked) {
+         sio_pending_ack   = 1;
+-        sio_ack_remaining = SIO_ACK_CYCLES_DEFAULT;
++        sio_ack_remaining = ack_cycles;
+         sio_pending_ack_irq_en = sio_shift_ack_irq_en;
+     }
+ 
+     if (sio_tx_buffered) {
+         sio_shift_byte      = sio_tx_buffer;
+         sio_shift_active    = 1;
+-        sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
++        sio_shift_remaining = sio_transfer_cycles();
+         sio_shift_ack_irq_en = sio_tx_buffer_ack_irq_en;
+         sio_tx_buffered     = 0;
+         sio_tx_buffer_ack_irq_en = 0;
+diff --git a/runtime/tests/test_sio_timing.c b/runtime/tests/test_sio_timing.c
+new file mode 100644
+index 00000000..087c5bfd
+--- /dev/null
++++ b/runtime/tests/test_sio_timing.c
+@@ -0,0 +1,41 @@
++/* Tekken 2 patch 0011: SIO0 byte and /ACK timing (sio_timing.h). Values from
++ * PSX-SPX "Controller and Memory Card I/O Ports" (JOY_BAUD x 8 per byte, BIOS
++ * baud 0088h) and DuckStation ffb33c28 measured with Tekken 2 (difftrace IO
++ * log: IRQ7 1,538 cycles after a pad byte's write, 1,258 after a card byte's).
++ */
++
++#include "sio_timing.h"
++
++#include <stdio.h>
++
++static int s_fail, s_checks;
++
++static void check(int ok, const char *what, unsigned got, unsigned want) {
++    s_checks++;
++    if (!ok) {
++        s_fail++;
++        fprintf(stderr, "FAIL %s: got %u, want %u\n", what, got, want);
++    }
++}
++
++int main(void) {
++    /* Off (ENHANCED): the legacy 1,088 + 170 for every device and baud. */
++    check(sio_timing_transfer_cycles(0, 0x88) == 1088u, "off: transfer", sio_timing_transfer_cycles(0, 0x88), 1088);
++    check(sio_timing_transfer_cycles(0, 0x44) == 1088u, "off: baud ignored", sio_timing_transfer_cycles(0, 0x44), 1088);
++    check(sio_timing_ack_cycles(0, 0) == 170u, "off: pad ack", sio_timing_ack_cycles(0, 0), 170);
++    check(sio_timing_ack_cycles(0, 1) == 170u, "off: card ack", sio_timing_ack_cycles(0, 1), 170);
++
++    /* On (REFERENCE): JOY_BAUD x 8; the BIOS rate when JOY_BAUD is 0. */
++    check(sio_timing_transfer_cycles(1, 0x88) == 1088u, "on: bios baud", sio_timing_transfer_cycles(1, 0x88), 1088);
++    check(sio_timing_transfer_cycles(1, 0x44) == 544u, "on: double rate", sio_timing_transfer_cycles(1, 0x44), 544);
++    check(sio_timing_transfer_cycles(1, 0) == 1088u, "on: baud 0", sio_timing_transfer_cycles(1, 0), 1088);
++
++    /* On: the IRQ7 after a pad byte at 1,538, after a card byte at 1,258. */
++    check(sio_timing_transfer_cycles(1, 0x88) + sio_timing_ack_cycles(1, 0) == 1538u, "on: pad irq7",
++          sio_timing_transfer_cycles(1, 0x88) + sio_timing_ack_cycles(1, 0), 1538);
++    check(sio_timing_transfer_cycles(1, 0x88) + sio_timing_ack_cycles(1, 1) == 1258u, "on: card irq7",
++          sio_timing_transfer_cycles(1, 0x88) + sio_timing_ack_cycles(1, 1), 1258);
++
++    printf("sio_timing_test: %d of %d checks passed\n", s_checks - s_fail, s_checks);
++    return s_fail ? 1 : 0;
++}

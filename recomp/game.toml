@@ -1,0 +1,78 @@
+# psxrecomp game config for Tekken 2 (USA) (Rev 1), SLUS-00213, boot EXE v1.1.
+# Header fields come from the PS-X EXE header (probe_disc.py, 2026-11-14).
+# The disc is never committed: stage it under disc/ (gitignored) or pass --disc.
+
+[game]
+name = "Tekken 2"
+id = "SLUS-00213"
+region = "USA"
+players = 2
+exe = "disc/SLUS_002.13"
+disc = "disc/Tekken 2 (USA) (Rev 1).cue"
+load_address = "0x80010000"
+entry_pc = "0x800227DC"
+entry_point = "0x800227DC"
+text_size = "0x000F9800"
+size = "0x000F9800"
+stack_base = "0x801FFFF0"
+stack = "0x801FFFF0"
+
+# Redump "Tekken 2 (USA) (Rev 1)" Track 1 (Greatest Hits, SLUS-00213).
+[prepare_disc]
+out_dir = "disc"
+bin_name = "Tekken 2 (USA) (Rev 1) (Track 1).bin"
+cue_name = "Tekken 2 (USA) (Rev 1).cue"
+boot_exe = "SLUS_002.13"
+known_sizes = [717922128]
+known_md5 = [
+  "14c6b7308e1bf796fb36e523adde34d7",
+]
+known_sha1 = [
+  "699bd5831fbe3b662c59906ebf0acd3d1c3393f3",
+]
+known_crc32 = [
+  "670a8546",
+]
+
+[recompiler]
+# Derived from symbols.toml + seeds/probe_jal_targets.txt by scripts/sync_symbols.py.
+seeds = "seeds/ghidra_funcs.txt"
+out_dir = "generated"
+strict = true
+# Each range below was checked by hand against the code around it.
+data_funcs = []
+# Ranges are [start, end). The analyzer's first pass (generate-1) found no
+# code in them except functions seeded from data words that happen to decode
+# as JAL.
+data_ranges = [
+  # Header-adjacent tables before the first function (BNS table 0x80010160,
+  # XA table 0x80011490).
+  ["0x80010000", "0x800126E8"],
+  # Tables after the last BIOS thunk (0x8002F5DC, 16 bytes) up to the next
+  # code at 0x8005EC9C: move records (0x80042864), condition-handler jump table
+  # (0x8004E230), bone parents, sine and character tables. Holds the false
+  # seeds 0x80042A40, 0x80042FF0, 0x80043014 and 0x8004100C.
+  ["0x8002F5EC", "0x8005EC9C"],
+  # Everything after the last code (0x800A0E70) to the end of text: stage
+  # lighting (0x800A1030) and other tables. Holds the false seeds 0x800C2DC0,
+  # 0x800C5BF4, 0x800C6888 and 0x80106154.
+  ["0x800A0E70", "0x80109800"],
+]
+
+[runtime]
+overlay_cache = true
+window_title = "Tekken 2 Recompiled"
+memcard_dir = "saves"
+
+[video]
+renderer = "opengl"
+aspect_ratio = "4:3"
+
+[controller]
+default_mode = "digital"
+allow_hybrid = false
+
+[netplay]
+require_cue = true
+required_tracks = 3
+required_disc_fp = "e9e132800fa8cd648cc6ba15ed87e835f5cf94b551f27006a22820dfd33dfe92"

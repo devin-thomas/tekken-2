@@ -1,0 +1,46 @@
+{
+  "format_version": 1,
+  "game": {
+    "name": "Tekken 2 (USA) (Rev 1)",
+    "id": "SLUS-00213",
+    "boot_exe": "SLUS_002.13"
+  },
+  "marketing": {
+    "description": "",
+    "publisher": "",
+    "year": "",
+    "region": "",
+    "players": 2
+  },
+  "rom_identity": {
+    "cue_name": "Tekken 2 (USA) (Rev 1).cue",
+    "bin_name": "Tekken 2 (USA) (Rev 1) (Track 1).bin",
+    "track_counts": [
+      3
+    ],
+    "require_cue": true,
+    "data_track": {
+      "size": 717922128,
+      "md5": "14c6b7308e1bf796fb36e523adde34d7",
+      "sha1": "699bd5831fbe3b662c59906ebf0acd3d1c3393f3",
+      "crc32": "670a8546"
+    },
+    "disc_fp": "e9e132800fa8cd648cc6ba15ed87e835f5cf94b551f27006a22820dfd33dfe92"
+  },
+  "exe": {
+    "load_address": "0x80010000",
+    "entry_pc": "0x800227DC",
+    "text_size": "0x000F9800",
+    "stack_base": "0x801FFFF0"
+  },
+  "seeds": {
+    "count": 1055,
+    "source": "boot_exe_jal"
+  },
+  "warnings": [],
+  "notes": [
+    "entry_pc/load_address/text_size/stack_base taken from PS-X EXE header.",
+    "seeds are first-pass boot-EXE JAL targets (+ entry); expect to grow as overlays / runtime paths are discovered.",
+    "required_disc_fp is psxrecomp-toc-v1 (matches runtime DiscIdentity)."
+  ]
+}

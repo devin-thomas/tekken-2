@@ -1,0 +1,280 @@
+diff --git a/runtime/include/psx_title_hooks.h b/runtime/include/psx_title_hooks.h
+new file mode 100644
+index 00000000..47742c17
+--- /dev/null
++++ b/runtime/include/psx_title_hooks.h
+@@ -0,0 +1,84 @@
++/* psx_title_hooks.h -- Tekken 2 patch 0012: hooks a title's own code uses to
++ * supply the pads, see every host event, run once a host tick, and draw its
++ * own layers over the picture (patch 0013), without the recomp-ui launcher.
++ *
++ * Every hook is inert until a title registers: a build without a title hook
++ * set runs exactly as before. Register from a static initializer
++ * (PSX_MOD_CONSTRUCTOR in mod_plugins.h), before main().
++ *
++ * Threads: early, event, tick and pad run on the main (emulation) thread;
++ * layer runs on whichever thread presents (the render thread when it is on). */
++#ifndef PSX_TITLE_HOOKS_H
++#define PSX_TITLE_HOOKS_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PSX_TITLE_HOOKS_ABI 1
++
++typedef struct PsxTitlePad {
++    uint16_t buttons;     /* the PSX pad word, active low (0xFFFF: nothing held) */
++    uint8_t sticks[4];    /* lx, ly, rx, ry; 0x80 centred */
++    int analog;           /* 1: present as an analog DualShock; 0: a digital pad */
++} PsxTitlePad;
++
++/* One image the title draws over everything (patch 0013). */
++typedef struct PsxTitleLayer {
++    const uint32_t *pixels;   /* ARGB8888 (0xAARRGGBB), straight alpha, top row first */
++    int w, h;                 /* the image's size in pixels */
++    int x, y, dw, dh;         /* where it goes, in canvas units */
++    uint32_t version;         /* changes whenever the pixels do: the renderer
++                               * uploads the image only then */
++    int opaque;               /* set by the renderer before the call: 1 when it
++                               * copies pixels with no blending or scaling
++                               * (Vulkan): give an opaque image with w == dw,
++                               * h == dh, in canvas pixels (px_per_unit 1) */
++} PsxTitleLayer;
++
++#define PSX_TITLE_LAYERS 2
++
++typedef struct PsxTitleHooks {
++    int abi;                  /* PSX_TITLE_HOOKS_ABI */
++    /* main(), once the per-user home (settings.toml's folder) is known and
++     * before SDL_Init: a title sets SDL hints and environment switches here.
++     * The runtime then reads PSX_AUDIO_BUFFER_MS (milliseconds) over game.toml's
++     * audio_buffer_ms. */
++    void (*early)(const char *home_dir);
++    /* Every host SDL event (an SDL_Event*), first, in the game and in every
++     * host pause. Returns 1 to consume it. */
++    int (*event)(const void *sdl_event);
++    /* Once per host service: every frame while the game runs, every few
++     * milliseconds while a host pause holds it. */
++    void (*tick)(void);
++    /* Ports 0 and 1: return 1 and fill *out to supply that port's pad. A
++     * supplied port is always connected. The runtime's own seats, keyboard
++     * map and controller handles then stay out of those ports. */
++    int (*pad)(int port, PsxTitlePad *out);
++    /* Layer i (0..PSX_TITLE_LAYERS-1) over the picture and every host
++     * overlay: return 1 and fill *out to show it. canvas_w/canvas_h is the
++     * space the renderer draws in (OpenGL: the window's drawable pixels; the
++     * SDL renderer: its logical size), px_per_unit the device pixels in one
++     * canvas unit, so an image drawn at dw*px_per_unit pixels is sharp. The
++     * pixels must stay valid until the next call. */
++    int (*layer)(int index, int canvas_w, int canvas_h, float px_per_unit, PsxTitleLayer *out);
++} PsxTitleHooks;
++
++/* Register (NULL clears). Refuses another ABI version (returns 0). */
++int psx_title_set_hooks(const PsxTitleHooks *hooks);
++const PsxTitleHooks *psx_title_hooks(void);
++
++/* Runtime side. */
++void psx_title_early(const char *home_dir);
++int  psx_title_event(const void *sdl_event);
++void psx_title_tick(void);
++int  psx_title_pad(int port, PsxTitlePad *out);
++int  psx_title_pads_active(void);   /* the title supplies the pads */
++int  psx_title_layer(int index, int canvas_w, int canvas_h, float px_per_unit, PsxTitleLayer *out);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 256027b6..51579743 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -476,6 +476,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/psx_disc_tray.c
+     ${PSXRECOMP_ROOT}/runtime/src/psx_runtime_menu.c
+     ${PSXRECOMP_ROOT}/runtime/src/psx_host_menu.c
++    ${PSXRECOMP_ROOT}/runtime/src/psx_title_hooks.c
+     ${PSXRECOMP_ROOT}/runtime/src/host_keymap.c
+     ${PSXRECOMP_ROOT}/runtime/src/cosim_state.c
+     ${PSXRECOMP_ROOT}/runtime/src/cosim.c
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 39eb2eda..dbc6bf8d 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -157,6 +157,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
+ #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
+ #include "psx_keybinds.h"
+ #include "host_overlay.h"
++#include "psx_title_hooks.h"   /* Tekken 2 patch 0012: title pads, events, tick */
+ #include "psx_disc_tray.h"
+ #include "psx_runtime_menu.h"
+ #include "psx_host_menu.h"
+@@ -6973,6 +6974,29 @@ static int capture_host_layer_pad(PsxNetPad* out, uint16_t word,
+     return 1;
+ }
+ 
++/* Tekken 2 patch 0012: a port the title supplies (psx_title_hooks.h). Always
++ * connected; digital unless the title asks for analog. */
++static int title_debug_pad_armed(void) {
++#ifndef PSX_NO_DEBUG_TOOLS
++    return debug_server_get_host_pad(nullptr, nullptr, nullptr, nullptr) ? 1 : 0;
++#else
++    return 0;
++#endif
++}
++static int capture_title_pad(PsxNetPad* out, const PsxTitlePad& tp, bool guarded) {
++    const bool analog = tp.analog != 0;
++    out->buttons = tp.buttons;
++    out->lx = analog ? tp.sticks[0] : 0x80; out->ly = analog ? tp.sticks[1] : 0x80;
++    out->rx = analog ? tp.sticks[2] : 0x80; out->ry = analog ? tp.sticks[3] : 0x80;
++    out->analog = analog ? SIO_PAD_DUALSHOCK : SIO_PAD_DIGITAL;
++    out->connected = 1;
++    if (guarded) {
++        out->buttons = 0xFFFFu;
++        out->lx = out->ly = out->rx = out->ry = 0x80u;
++    }
++    return 1;
++}
++
+ /* host_view: the port's host pad before presentation, for a title pad
+  * transform (PadExtHooks.host_pad): real sticks and buttons without the
+  * digital stick->D-pad fold, whatever the configured mode; type unchanged. */
+@@ -6986,6 +7010,13 @@ static int capture_pad_slot_view(int s, PsxNetPad* out, bool guarded,
+     out->analog = 0;
+     out->connected = 0;
+ 
++    /* Tekken 2 patch 0012: a port the title supplies, ahead of the host pad
++     * layer (the title reads the on-screen controller itself); the debug
++     * server's virtual pad still wins. */
++    if (s < 2 && psx_title_pads_active() && !title_debug_pad_armed()) {
++        PsxTitlePad tp;
++        if (psx_title_pad(s, &tp)) return capture_title_pad(out, tp, guarded);
++    }
+     if (s == 0) {
+         uint16_t host_word;
+         uint8_t host_st[4], host_lt, host_rt;
+@@ -7102,6 +7133,10 @@ static int capture_pad_slot_exclusive(int s, PsxNetPad* out, int present_sio_slo
+     out->analog = 0;
+     out->connected = 0;
+ 
++    if (s < 2 && psx_title_pads_active() && !title_debug_pad_armed()) {
++        PsxTitlePad tp;   /* Tekken 2 patch 0012 */
++        if (psx_title_pad(s, &tp)) return capture_title_pad(out, tp, false);
++    }
+     /* An explicit virtual host device follows the same local-device -> session
+      * seat route as a physical controller. It is not a simulation SIO override. */
+     if (s == 0) {
+@@ -7704,6 +7739,7 @@ static void netplay_barrier_admit(int override) {
+                 /* The in-game overlay sees events first here too: the netplay
+                  * admit wait polls every frame, and an Esc meant for the menu
+                  * must not end the match. */
++                if (psx_title_event(&ev)) continue;   /* Tekken 2 patch 0012 */
+                 if (psx_host_input_sink_dispatch(&ev)) continue;
+                 if (ev.type == SDL_QUIT) {
+                     netplay_soft_exit("sdl_window_close");
+@@ -8950,6 +8986,7 @@ static void host_pause_loop(void) {
+         SDL_Event ev;
+         while (!g_headless && SDL_PollEvent(&ev)) {
+             (void)psx_local_mouse_event(ev);
++            if (psx_title_event(&ev)) continue;   /* Tekken 2 patch 0012 */
+             if (host_pause_event(ev)) continue;
+             if (ev.type == SDL_QUIT) {
+                 psx_crash_trace_set_exit_origin("sdl_window_close");
+@@ -9239,6 +9276,8 @@ static bool drain_host_events() {
+     SDL_Event ev;
+     while (SDL_PollEvent(&ev)) {
+         if (psx_local_mouse_event(ev)) continue;
++        /* Tekken 2 patch 0012: the title's input layer sees every event. */
++        if (psx_title_event(&ev)) continue;
+         /* In-game overlay provider sees events first (host_overlay.h P3). */
+         if (psx_host_input_sink_dispatch(&ev)) continue;
+         if (ev.type == SDL_QUIT) {
+@@ -17705,6 +17744,7 @@ static void recomp_overlay_detach(void) {
+ }
+ 
+ static void host_pause_service(void) {
++    psx_title_tick();   /* Tekken 2 patch 0012 */
+     if (!g_ovl_on) return;
+     mh_refresh_snapshot();
+     if (const int disc = g_ovl_disc_req.exchange(0)) {
+@@ -18976,6 +19016,16 @@ int main(int argc, char** argv) {
+     {
+         std::filesystem::path settings_path =
+             exe_dir_from_argv(argv[0]) / "settings.toml";
++        /* Tekken 2 patch 0012: the title's early hook (SDL hints, switches),
++         * then its audio buffer choice over game.toml's. */
++        psx_title_early(settings_path.parent_path().string().c_str());
++        if (const char* e = std::getenv("PSX_AUDIO_BUFFER_MS")) {
++            const int ms = std::atoi(e);
++            if (ms >= 20 && ms <= 1000) {
++                resolved_audio_buffer_ms = ms;
++                std::fprintf(stdout, "psxrecomp: audio buffer %d ms (PSX_AUDIO_BUFFER_MS)\n", ms);
++            }
++        }
+ #if defined(RECOMP_LAUNCHER)
+         g_lnch_settings_path = settings_path;
+         g_overlay_settings_path = settings_path;
+@@ -21150,6 +21200,11 @@ session_reboot:
+             ? (SDL_JoystickID)(player_instance[s] - 1) : -1;
+         g_players[s].deadzone = player_deadzone[s];
+     }
++    /* Tekken 2 patch 0012: ports the title supplies are always connected and
++     * never open a controller of their own (the title opens every one). */
++    if (psx_title_pads_active())
++        for (int s = 0; s < 2 && s < PSX_MAX_PLAYERS; ++s)
++            set_player_device(g_players[s], "keyboard", player_mode[s]);
+     /* Multitap stays OFF through BIOS boot: SCPH-1070 on port 1 breaks shell /
+      * LoadExe pad bring-up for titles that expect a lone digital pad. Offline
+      * 3+ player builds arm it after game entry (see vblank path); netplay arms
+diff --git a/runtime/src/psx_title_hooks.c b/runtime/src/psx_title_hooks.c
+new file mode 100644
+index 00000000..aea41bce
+--- /dev/null
++++ b/runtime/src/psx_title_hooks.c
+@@ -0,0 +1,43 @@
++/* psx_title_hooks.c -- Tekken 2 patch 0012: the title hook registry
++ * (psx_title_hooks.h). */
++#include "psx_title_hooks.h"
++
++#include <stddef.h>
++
++static const PsxTitleHooks *s_hooks = NULL;
++
++int psx_title_set_hooks(const PsxTitleHooks *hooks) {
++    if (hooks && hooks->abi != PSX_TITLE_HOOKS_ABI) return 0;
++    s_hooks = hooks;
++    return 1;
++}
++
++const PsxTitleHooks *psx_title_hooks(void) { return s_hooks; }
++
++void psx_title_early(const char *home_dir) {
++    if (s_hooks && s_hooks->early) s_hooks->early(home_dir);
++}
++
++int psx_title_event(const void *sdl_event) {
++    return s_hooks && s_hooks->event ? s_hooks->event(sdl_event) : 0;
++}
++
++void psx_title_tick(void) {
++    if (s_hooks && s_hooks->tick) s_hooks->tick();
++}
++
++int psx_title_pads_active(void) { return s_hooks && s_hooks->pad; }
++
++int psx_title_pad(int port, PsxTitlePad *out) {
++    if (!s_hooks || !s_hooks->pad || !out || port < 0 || port > 1) return 0;
++    return s_hooks->pad(port, out);
++}
++
++int psx_title_layer(int index, int canvas_w, int canvas_h, float px_per_unit,
++                    PsxTitleLayer *out) {
++    if (!s_hooks || !s_hooks->layer || !out || index < 0 || index >= PSX_TITLE_LAYERS ||
++        canvas_w <= 0 || canvas_h <= 0)
++        return 0;
++    if (!s_hooks->layer(index, canvas_w, canvas_h, px_per_unit, out)) return 0;
++    return out->pixels && out->w > 0 && out->h > 0 && out->dw > 0 && out->dh > 0;
++}

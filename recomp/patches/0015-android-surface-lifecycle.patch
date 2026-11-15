@@ -1,0 +1,198 @@
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 51579743..e7e0904c 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -509,6 +509,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/guest_cycle_profile.c
+     ${PSXRECOMP_ROOT}/runtime/src/latency_ring.c
+     ${PSXRECOMP_ROOT}/runtime/src/frame_trace.c
++    ${PSXRECOMP_ROOT}/runtime/src/android_game_window.c  # Tekken 2 patch 0015 (Android only inside)
+     ${PSXRECOMP_ROOT}/runtime/src/stereo_shed_policy.c
+     ${PSXRECOMP_ROOT}/runtime/src/present_image_ring.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_timeline.c
+diff --git a/runtime/src/android_game_window.c b/runtime/src/android_game_window.c
+new file mode 100644
+index 00000000..d59b076a
+--- /dev/null
++++ b/runtime/src/android_game_window.c
+@@ -0,0 +1,72 @@
++/* android_game_window.c (Tekken 2 patch 0015): the game view's ANativeWindow,
++ * held by the runtime itself so the Vulkan renderer never builds a surface
++ * from a window Android has already taken away.
++ *
++ * Why: SDL keeps its own pointer to the window and releases it, from the Java
++ * UI thread, in surfaceDestroyed (Home, the power button, the recents list).
++ * The game thread keeps running until it next pumps events. On the Galaxy S21
++ * Ultra on 2026-11-14 a present in that gap failed (the BufferQueue was
++ * abandoned), the renderer asked SDL for a new VkSurfaceKHR, and SDL handed
++ * vkCreateAndroidSurfaceKHR its now-NULL window: SIGSEGV in libvulkan, and the
++ * game restarted from the beginning when Gohan came back to it.
++ *
++ * T2Activity reports its SurfaceView's Surface here from the surface callbacks
++ * (created, changed, destroyed). Each report takes or drops a reference under
++ * a mutex (and bumps a generation when the window object changes), so the
++ * renderer sees "no window: skip presenting" instead of a dangling pointer,
++ * and a window it is handed stays valid while it makes the surface. A shell
++ * that never reports keeps SDL's path (known() == 0). */
++#if defined(__ANDROID__)
++#include <android/native_window.h>
++#include <android/native_window_jni.h>
++#include <jni.h>
++#include <pthread.h>
++#include <stdio.h>
++
++static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
++static ANativeWindow *s_window;   /* one reference held while set */
++static unsigned s_generation;     /* bumped whenever s_window changes */
++static int s_known;               /* the app shell reports its surface */
++
++JNIEXPORT void JNICALL
++Java_com_uppercutlabs_tekken2recomp_T2Activity_nativeGameSurface(JNIEnv *env, jclass cls,
++                                                                 jobject surface)
++{
++    (void)cls;
++    ANativeWindow *next = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
++    ANativeWindow *old = NULL;
++    pthread_mutex_lock(&s_lock);
++    s_known = 1;
++    if (next != s_window) {
++        old = s_window;
++        s_window = next;
++        s_generation++;
++        next = NULL;              /* the reference moved into s_window */
++    }
++    pthread_mutex_unlock(&s_lock);
++    if (next) ANativeWindow_release(next);   /* same window again: drop the extra ref */
++    if (old) ANativeWindow_release(old);
++}
++
++int psx_android_game_window_known(void)
++{
++    pthread_mutex_lock(&s_lock);
++    const int known = s_known;
++    pthread_mutex_unlock(&s_lock);
++    return known;
++}
++
++/* The current window with a reference the caller must release, or NULL while
++ * the app is in the background. *generation gets the window's generation. */
++ANativeWindow *psx_android_game_window_acquire(unsigned *generation)
++{
++    pthread_mutex_lock(&s_lock);
++    ANativeWindow *w = s_window;
++    if (w) ANativeWindow_acquire(w);
++    if (generation) *generation = s_generation;
++    pthread_mutex_unlock(&s_lock);
++    return w;
++}
++#else
++typedef int psx_android_game_window_unused; /* not Android: nothing here */
++#endif
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index 4ac936eb..8aec7828 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -64,6 +64,27 @@ const GpuRenderBackend *vk_backend_get(void) { return 0; }
+ #include "vk_shaders_spv.h"   /* generated: spv_geo_vert/frag, spv_geo_tex_vert/frag,
+                                *            spv_pack_comp, spv_blit_vert/frag */
+ 
++#if defined(__ANDROID__)
++/* Tekken 2 patch 0015: every VkSurfaceKHR on Android is made from the window
++ * the app shell reported (android_game_window.c), never from SDL's pointer.
++ * SDL releases that pointer on the UI thread in surfaceDestroyed (Home, the
++ * power button) while this thread can still be presenting; on the Galaxy S21
++ * Ultra a present in that gap failed, patch 0005's rebuild asked SDL for a
++ * new surface and vkCreateAndroidSurfaceKHR got a NULL window (SIGSEGV, the
++ * game restarted from scratch). With no window the call fails cleanly and
++ * the frame is skipped until the app is back. Routed through a macro so
++ * patch 0005's rebuild code stays as it is. */
++#include <android/native_window.h>
++#include <vulkan/vulkan_android.h>
++extern int psx_android_game_window_known(void);
++extern ANativeWindow *psx_android_game_window_acquire(unsigned *generation);
++static bool t2_android_create_surface(SDL_Window *win, VkInstance inst,
++                                      const VkAllocationCallbacks *alloc, VkSurfaceKHR *out);
++#define SDL_Vulkan_CreateSurface(w, i, a, s) t2_android_create_surface((w), (i), (a), (s))
++static unsigned s_t2_surface_gen;   /* window generation s_surface was made from */
++static int t2_android_window_state(void);
++#endif
++
+ #define VRAM_W 1024
+ #define VRAM_H 512
+ 
+@@ -580,6 +601,52 @@ static void vk_log(const char *msg) { fprintf(stdout, "psxrecomp: vulkan: %s\n",
+ 
+ static int vk_die(const char *why) { fprintf(stdout, "psxrecomp: vulkan: %s\n", why); return 0; }
+ 
++#if defined(__ANDROID__)
++/* Tekken 2 patch 0015 (see the top of the file). */
++static bool t2_android_create_surface(SDL_Window *win, VkInstance inst,
++                                      const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
++    static int waiting;   /* log "no window" once per gap */
++    if (!psx_android_game_window_known())
++        return (SDL_Vulkan_CreateSurface)(win, inst, alloc, out);   /* an older shell */
++    unsigned gen = 0;
++    ANativeWindow *w = psx_android_game_window_acquire(&gen);
++    if (!w) {
++        if (!waiting) fprintf(stdout, "psxrecomp: vulkan: no Android window (in the background); not presenting\n");
++        waiting = 1;
++        *out = VK_NULL_HANDLE;
++        return false;
++    }
++    PFN_vkCreateAndroidSurfaceKHR create = (PFN_vkCreateAndroidSurfaceKHR)
++        p_vkGetInstanceProcAddr(inst, "vkCreateAndroidSurfaceKHR");
++    VkAndroidSurfaceCreateInfoKHR ci = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
++    ci.window = w;
++    VkResult r = create ? create(inst, &ci, alloc, out) : VK_ERROR_EXTENSION_NOT_PRESENT;
++    ANativeWindow_release(w);   /* the surface holds its own reference */
++    if (r != VK_SUCCESS) {
++        fprintf(stdout, "psxrecomp: vulkan: vkCreateAndroidSurfaceKHR failed (%d)\n", (int)r);
++        *out = VK_NULL_HANDLE;
++        return false;
++    }
++    waiting = 0;
++    s_t2_surface_gen = gen;
++    return true;
++}
++
++/* Before each present: 1 = the app shell has no window (in the background):
++ * skip the frame and leave the swapchain alone; 2 = the window is not the one
++ * s_surface was made from (back from the background): rebuild on the new
++ * one; 0 = carry on. Without this the renderer only noticed a new window
++ * when the old swapchain failed, and could present into a dying one. */
++static int t2_android_window_state(void) {
++    if (!psx_android_game_window_known()) return 0;
++    unsigned gen = 0;
++    ANativeWindow *w = psx_android_game_window_acquire(&gen);
++    if (!w) return 1;
++    ANativeWindow_release(w);
++    return (s_surface == VK_NULL_HANDLE || gen != s_t2_surface_gen) ? 2 : 0;
++}
++#endif
++
+ static uint32_t find_mem_type(uint32_t type_bits, VkMemoryPropertyFlags want) {
+     for (uint32_t i = 0; i < s_memprops.memoryTypeCount; i++) {
+         if ((type_bits & (1u << i)) &&
+@@ -1610,6 +1677,22 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
+     return 1;
+ }
+ 
++#if defined(__ANDROID__)
++/* Tekken 2 patch 0015: before each present, ask whether the app still has a
++ * window (t2_android_window_state, at the top of the file). In the background
++ * the frame is skipped and the swapchain left alone; back from it, the
++ * swapchain is rebuilt on the new window before anything is drawn into it.
++ * Every present path below calls acquire_present, so the macro covers them. */
++static int t2_acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
++                              uint32_t *out_idx, uint32_t *out_frame) {
++    const int ws = t2_android_window_state();
++    if (ws == 1) return 0;
++    if (ws == 2 && !android_rebuild_swapchain(1)) return 0;
++    return acquire_present(out_sc, out_cb, out_idx, out_frame);
++}
++#define acquire_present t2_acquire_present
++#endif
++
+ /* Copy host toast into the swapchain (must still be TRANSFER_DST). Opaque
+  * overwrite — host_osd bakes an opaque panel so no blend pass is needed. */
+ static VkBuffer       s_osd_buf  = VK_NULL_HANDLE;

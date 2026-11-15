@@ -1,0 +1,246 @@
+diff --git a/runtime/include/psx_fullscreen_input.h b/runtime/include/psx_fullscreen_input.h
+new file mode 100644
+index 00000000..37fcaaf2
+--- /dev/null
++++ b/runtime/include/psx_fullscreen_input.h
+@@ -0,0 +1,49 @@
++/* psx_fullscreen_input.h -- Tekken 2 patch 0014: the fullscreen double-click,
++ * from the GGX+ port's in_image_middle (sdl/ggx_main.c;
++ * MIT, Copyright (c) 2026 Lil Gohan).
++ *
++ * A double-click with the left button switches fullscreen only inside the
++ * middle half of the presented picture, so clicks on the bars, at the
++ * picture's edges or on the window's own controls never do. Pure, for the
++ * tests. */
++#ifndef PSX_FULLSCREEN_INPUT_H
++#define PSX_FULLSCREEN_INPUT_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The picture is the largest aspect_num:aspect_den rectangle centred in a
++ * win_w x win_h window (window coordinates, as mouse events give them).
++ * 1 when (x, y) is inside its middle half (the middle half of its width and
++ * of its height). */
++static inline int psx_fs_in_image_middle(int win_w, int win_h, int aspect_num,
++                                         int aspect_den, float x, float y)
++{
++    float iw, ih, cx, cy;
++
++    if (win_w <= 0 || win_h <= 0 || aspect_num <= 0 || aspect_den <= 0) return 0;
++    iw = (float)win_w;
++    ih = iw * (float)aspect_den / (float)aspect_num;
++    if (ih > (float)win_h) {
++        ih = (float)win_h;
++        iw = ih * (float)aspect_num / (float)aspect_den;
++    }
++    cx = (float)win_w * 0.5f;
++    cy = (float)win_h * 0.5f;
++    return x >= cx - iw * 0.25f && x <= cx + iw * 0.25f &&
++           y >= cy - ih * 0.25f && y <= cy + ih * 0.25f;
++}
++
++/* 1 for a fullscreen double-click: the left button's second click, from a
++ * real mouse (not a touch SDL turned into a click). */
++static inline int psx_fs_is_double_click(int is_button_down, int button,
++                                         int clicks, int from_touch)
++{
++    return is_button_down && button == 1 && clicks == 2 && !from_touch;
++}
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/runtime/include/window_fullscreen.h b/runtime/include/window_fullscreen.h
+index f8c46cda..07af783e 100644
+--- a/runtime/include/window_fullscreen.h
++++ b/runtime/include/window_fullscreen.h
+@@ -100,8 +100,13 @@ static inline int psx_window_fullscreen_set(SDL_Window* window,
+     } else {
+         SDL_SetWindowBordered(window, state->bordered ? SDL_TRUE : SDL_FALSE);
+         SDL_SetWindowResizable(window, state->resizable ? SDL_TRUE : SDL_FALSE);
+-        SDL_SetWindowSize(window, state->width, state->height);
+-        SDL_SetWindowPosition(window, state->x, state->y);
++        /* Tekken 2 patch 0014: after the system's own fullscreen control
++         * (macOS's green button) no windowed geometry was saved; the window
++         * manager restores the window itself. */
++        if (state->width > 0 && state->height > 0) {
++            SDL_SetWindowSize(window, state->width, state->height);
++            SDL_SetWindowPosition(window, state->x, state->y);
++        }
+         if (mode == 2) {
+ #if defined(PSX_SDL3)
+             if (!SDL_SetWindowFullscreen(window, true)) return -1;
+diff --git a/runtime/src/host_keymap.c b/runtime/src/host_keymap.c
+index ea032a30..b82f7283 100644
+--- a/runtime/src/host_keymap.c
++++ b/runtime/src/host_keymap.c
+@@ -93,6 +93,8 @@ static void apply_defaults(void) {
+     if (want_default(HOST_KEYMAP_FULLSCREEN)) {
+         add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_RETURN, (int)SDL_SCANCODE_RETURN, KMOD_ALT);
+         add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_f, (int)SDL_SCANCODE_F, KMOD_CTRL);
++        /* Tekken 2 patch 0014: F11 too, with Alt+Enter and the double-click. */
++        add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_F11, (int)SDL_SCANCODE_F11, 0);
+     }
+     if (want_default(HOST_KEYMAP_TURBO))
+         add_bind(HOST_KEYMAP_TURBO, (int)SDLK_TAB, (int)SDL_SCANCODE_TAB, 0);
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index d59f79a0..74e14037 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -187,6 +187,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
+ #endif
+ #include "psx_sdl.h"
+ #include "window_fullscreen.h"
++#include "psx_fullscreen_input.h"   /* Tekken 2 patch 0014: double-click */
+ #if defined(PSX_SDL3)
+ /*
+  * SDL_main.h is a single-header implementation in SDL3. Keep it in the one
+@@ -9272,6 +9273,33 @@ static void toggle_live_pad_mode(int s) {
+                                                "Analog mode requested", 1500);
+ }
+ 
++static std::filesystem::path g_overlay_settings_path;  /* settings.toml */
++/* Tekken 2 patch 0014: one fullscreen switch for Alt+Enter, F11 and the
++ * double-click, remembered in settings.toml ([video] fullscreen) so the next
++ * start opens the same way. */
++static bool local_mouse_live(int override_word);
++static void fullscreen_remember(int mode) {
++    if (g_overlay_settings_path.empty()) return;
++    try {
++        PSXRecompV4::UserSettings us = PSXRecompV4::load_user_settings(g_overlay_settings_path);
++        if (us.has_fullscreen && us.fullscreen == mode) return;
++        us.fullscreen = mode; us.has_fullscreen = true;
++        (void)PSXRecompV4::save_user_settings(g_overlay_settings_path, us);
++    } catch (...) {
++    }
++}
++static void fullscreen_toggle_live(const char* why) {
++    const int target = s_window_fullscreen.mode ? 0 : (g_fullscreen ? g_fullscreen : 1);
++    if (psx_window_fullscreen_set(sdl_window, &s_window_fullscreen, target) == 0) {
++        apply_present_cadence();
++        log_present_cadence();
++        host_osd_push(target ? "Fullscreen" : "Windowed", 1500);
++        std::fprintf(stdout, "psxrecomp: %s (%s)\n", target ? "fullscreen" : "windowed", why);
++        fullscreen_remember(target);
++    } else
++        host_osd_push("Fullscreen change failed", 1500);
++}
++
+ static bool drain_host_events() {
+     SDL_Event ev;
+     while (SDL_PollEvent(&ev)) {
+@@ -9288,6 +9316,47 @@ static bool drain_host_events() {
+             psx_crash_trace_set_exit_origin("sdl_window_close");
+             shutdown_runtime();
+             std::exit(0);
++#if defined(PSX_SDL3) && !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
++        } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
++            /* Tekken 2 patch 0014: a double-click on the middle of the
++             * picture switches fullscreen; never while the guest owns the
++             * mouse. Phones are always fullscreen. */
++            int ww = 0, wh = 0;
++            if (sdl_window && psx_fs_is_double_click(1, ev.button.button, ev.button.clicks,
++                                                     ev.button.which == SDL_TOUCH_MOUSEID) &&
++                !local_mouse_live(-1) && SDL_GetWindowSize(sdl_window, &ww, &wh) &&
++                psx_fs_in_image_middle(ww, wh, g_video_aspect_num, g_video_aspect_den,
++                                       ev.button.x, ev.button.y))
++                fullscreen_toggle_live("double-click");
++        } else if (ev.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
++                   ev.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
++            /* The system's own control (macOS's green button): follow it, so
++             * the next key or double-click goes the right way. Our own
++             * switches arrive here too, once the state already says so; a
++             * stale event is checked against the window's flags. */
++            const bool full = sdl_window &&
++                (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN) != 0;
++            if (ev.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN && full && !s_window_fullscreen.mode) {
++                s_window_fullscreen.mode = 1;
++                s_window_fullscreen.width = s_window_fullscreen.height = 0;
++                apply_present_cadence();
++                fullscreen_remember(1);
++                std::fprintf(stdout, "psxrecomp: fullscreen (window control)\n");
++            } else if (ev.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN && !full &&
++                       s_window_fullscreen.mode) {
++#if defined(_WIN32)
++                /* Windows' borderless mode is a plain window, never SDL
++                 * fullscreen; only exclusive mode leaves through here. */
++                if (s_window_fullscreen.mode == 2)
++#endif
++                {
++                    s_window_fullscreen.mode = 0;
++                    apply_present_cadence();
++                    fullscreen_remember(0);
++                    std::fprintf(stdout, "psxrecomp: windowed (window control)\n");
++                }
++            }
++#endif
+         } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+             refresh_player_devices();
+         } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+@@ -9421,7 +9490,7 @@ static bool drain_host_events() {
+                                                 (int)mod)) {
+                 host_volume_adjust(-5);
+             }
+-            /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. Toggles between
++            /* Fullscreen toggle: Alt+Enter, F11 (patch 0014) or Cmd/Ctrl+F. Toggles between
+              * windowed and the CONFIGURED tri-state mode (g_fullscreen: 1
+              * borderless desktop fullscreen keeping the desktop resolution
+              * and letterboxing the image, or 2 exclusive fullscreen — a
+@@ -9431,14 +9500,7 @@ static bool drain_host_events() {
+                      host_keymap_match_event(HOST_KEYMAP_FULLSCREEN,
+                                              (int)key, (int)scancode,
+                                              (int)mod)) {
+-                const int target = s_window_fullscreen.mode ? 0 :
+-                                   (g_fullscreen ? g_fullscreen : 1);
+-                if (psx_window_fullscreen_set(sdl_window, &s_window_fullscreen, target) == 0) {
+-                    apply_present_cadence();
+-                    log_present_cadence();
+-                    host_osd_push(target ? "Fullscreen" : "Windowed", 1500);
+-                } else
+-                    host_osd_push("Fullscreen change failed", 1500);
++                fullscreen_toggle_live(scancode == SDL_SCANCODE_F11 ? "F11" : "key");
+             }
+         }
+     }
+@@ -10899,7 +10961,7 @@ static void session_internal_resolution(void) {
+ }
+ 
+ /* ---- Live video apply (host_overlay.h P4) ------------------------------- */
+-static std::filesystem::path g_overlay_settings_path;  /* settings.toml */
++/* g_overlay_settings_path: declared above (Tekken 2 patch 0014 uses it earlier). */
+ static PsxHostVideoSettings g_video_boot;              /* as the session booted */
+ static bool g_video_boot_valid = false;
+ /* Live Internal resolution / Supersample. g_video_internal_res and
+@@ -11110,7 +11172,8 @@ static int host_resolution_apply_live(void) {
+  *   7 geometry correction (sub-pixel vertices)
+  *   8 perspective-correct texturing   0 summary
+  *   9 PGXP depth buffer   F10 PGXP perspective-correct colour
+- *   F11 PGXP seam expansion off -> fine -> wide   F12 PGXP CPU mode */
++ *   - (minus) PGXP seam expansion off -> fine -> wide   F12 PGXP CPU mode
++ *   (Tekken 2 patch 0014: the seam key moved off F11, which is fullscreen.) */
+ extern "C" void pgxp_set_cpu_mode(int enabled);
+ extern "C" int  pgxp_cpu_mode(void);
+ extern "C" void gte_geometry_correction_set(int enabled);
+@@ -11210,7 +11273,7 @@ static int debug_toggle_key(int key, char *out, int cap) {
+         gl_renderer_set_pgxp_color_perspective(on);
+         std::snprintf(msg, sizeof msg, "PGXP perspective colour: %s", on ? "on" : "off");
+         break; }
+-    case SDLK_F11: {
++    case SDLK_MINUS: {
+         const int m = (gl_renderer_get_pgxp_seam() + 1) % 3;
+         gl_renderer_set_pgxp_seam(m);
+         std::snprintf(msg, sizeof msg, "PGXP seam expansion: %s",
+@@ -11235,7 +11298,9 @@ static int debug_toggle_key(int key, char *out, int cap) {
+ }
+ /* Debug server: simulate a toggle key ({"cmd":"debug_key","key":"1"}). */
+ extern "C" int psx_debug_toggle_key(int ch, char *out, int cap) {
+-    if (ch >= 'b' && ch <= 'd')   /* F10..F12 */
++    if (ch == 'c')                /* the PGXP seam key, minus since patch 0014 */
++        return debug_toggle_key((int)SDLK_MINUS, out, cap);
++    if (ch == 'b' || ch == 'd')   /* F10, F12 */
+         return debug_toggle_key((int)(SDLK_F10 + (ch - 'b')), out, cap);
+     if (ch < '0' || ch > '9') return 0;
+     return debug_toggle_key((int)(SDLK_0 + (ch - '0')), out, cap);
