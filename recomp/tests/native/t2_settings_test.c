@@ -385,7 +385,7 @@ int main(int argc, char **argv)
     /* a player release (-DT2_RELEASE=ON): no controller mode, renderer or frame skip rows,
        and the version after the title */
     host.minimal = 1;
-    host.version = "0.1.0";
+    host.version = "1.0.0";
     s = t2_settings_new(in, cfg, &host);
     t2_settings_open(s);
     tick(s, 0);

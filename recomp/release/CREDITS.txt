@@ -1,4 +1,4 @@
-Tekken 2 Recompiled 0.1.0: credits and licences
+Tekken 2 Recompiled 1.0.0: credits and licences
 ===============================================
 
 Tekken 2 Recompiled is by Lil Gohan

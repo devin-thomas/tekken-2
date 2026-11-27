@@ -1,4 +1,4 @@
-Tekken 2 Recompiled 0.1.0
+Tekken 2 Recompiled 1.0.0
 =========================
 
 Tekken 2 Recompiled is a native Mac and Windows version of Tekken 2, Namco's
@@ -14,7 +14,7 @@ The disc it needs
 -----------------
 
 Tekken 2 (USA) (Rev 1), serial SLUS-00213, the Greatest Hits pressing. Other
-releases (the first USA pressing, Europe and Japan) do not work with 0.1.0.
+releases (the first USA pressing, Europe and Japan) do not work with 1.0.0.
 
 Use a BIN/CUE image with all three tracks. Tracks 2 and 3 are the CD audio.
 Track 1 of the right disc matches the Redump record:

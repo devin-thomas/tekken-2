@@ -8,7 +8,7 @@ repo holds no game data: no disc image, no BIOS and no files from the disc.
 
 | Folder | What it is | State |
 | --- | --- | --- |
-| [`recomp/`](recomp/) | Tekken 2 Recompiled: the game's code translated to C with [psxrecomp](https://github.com/mstan/psxrecomp) and compiled for Mac and Windows | 0.1.0 |
+| [`recomp/`](recomp/) | Tekken 2 Recompiled: the game's code translated to C with [psxrecomp](https://github.com/mstan/psxrecomp) and compiled for Mac and Windows | 1.0.0 |
 | `decomp/` | A decompilation of Tekken 2, when it is released | Not yet published |
 | `ports/` | Ports built from the decompilation | Not yet published |
 
@@ -16,8 +16,8 @@ repo holds no game data: no disc image, no BIOS and no files from the disc.
 
 The [releases page](../../releases) has the current builds:
 
-- `Tekken-2-Recompiled-0.1.0-macOS-arm64.zip`: Apple silicon Macs, macOS 11 or later
-- `Tekken-2-Recompiled-0.1.0-Windows-x64.zip`: 64-bit Windows 10 and 11
+- `Tekken-2-Recompiled-1.0.0-macOS-arm64.zip`: Apple silicon Macs, macOS 11 or later
+- `Tekken-2-Recompiled-1.0.0-Windows-x64.zip`: 64-bit Windows 10 and 11
 
 Each release lists the SHA-256 of its zips. The README inside each zip says
 how to open the app the first time, which disc it needs and how to check it,
